@@ -22,14 +22,14 @@ Potential Future Improvements:
 - Add a slight twist to the louver wings to create outwash
 """
 import math
-import numpy as np
+import numpy as np  # version 2.3.3 used here
 from typing import Dict, List, Optional, Tuple, Callable, Union, Set
 from collections import Counter
-from scipy.spatial import Delaunay
+from scipy.spatial import Delaunay  # version 1.16.2 used here
 
 
 try:
-    import pyvista as pv
+    import pyvista as pv  # version 0.46.4 used here
     HAS_PYVISTA = True
 except ImportError:
     print("YOU REALLY WILL WANT PYVISTA FOR A PROPER FRONT CAP! Install it via 'pip install pyvista'")
