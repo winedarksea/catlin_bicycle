@@ -2617,6 +2617,13 @@ def build_fender(
     # Inside radius of the spine equals rim radius + tire growth + clearance
     spine_inner_radius_mm = rim_radius_mm + tire_radius_mm + radial_clearance_mm
 
+    print(f"\n=== WHEEL AND TIRE GEOMETRY ===")
+    print(f"  Rim diameter (BSD): {wheel_diameter_mm:.1f} mm")
+    print(f"  Tire height: {tire_radius_mm:.1f} mm")
+    print(f"  Full wheel diameter (with tire): {wheel_diameter_mm + 2 * tire_radius_mm:.1f} mm")
+    print(f"  Radial clearance: {radial_clearance_mm:.1f} mm")
+    print(f"=== END WHEEL GEOMETRY ===\n")
+
     # Build spine
     # Note: create_spine expects forward_extension_deg as a positive value
     spine_vertices, spine_faces = create_spine(
