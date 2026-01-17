@@ -1275,10 +1275,11 @@ def create_front_airfoil(
             n_dir = np.array([math.cos(theta), math.sin(theta), 0.0])
         
         # Calculate base position from the outer spine vertices (v2, v3)
-        # Offset slightly outward by half wall thickness to account for airfoil curvature
-        # This prevents the flat outer spine surface from poking through the curved inner airfoil wall
+        # Deepen the connection: sink the airfoil base INTO the spine.
+        # This increases the mechanical overlap for better structural strength
+        # while ensuring the airfoil profile does not protrude above the outer spine face.
         spine_outer_mid = (spine_vertices[v2_idx] + spine_vertices[v3_idx]) / 2.0
-        base_mid = spine_outer_mid + n_dir * (wall_thickness_mm / 2.0)
+        base_mid = spine_outer_mid - n_dir * (wall_thickness_mm / 2.0)
         
         # Tangent direction (perpendicular to radial, in XY plane)
         t_dir = np.array([-n_dir[1], n_dir[0], 0.0])
@@ -2456,7 +2457,7 @@ def build_fender(
         Nominal tyre width (mm). Used when estimating tyre radius.
     tire_radius_addition_mm : Union[float, str], optional
         Additional radial height contributed by the inflated tyre. Use the
-        string ``"auto"`` (default) to estimate this as ``0.88 *  tire_width_mm``
+        string ``"auto"`` (default) to estimate this as ``1.125 *  tire_width_mm``
     coverage_angle_deg : float, optional
         Angular coverage of the fender extending REARWARD from the top of the
         wheel (0°). For example, 100° extends from the top (12 o'clock) to about
@@ -2605,7 +2606,7 @@ def build_fender(
             raise ValueError(
                 'tire_radius_addition_mm must be a float value or the string "auto".'
             )
-        tire_radius_mm = 0.88 * tire_width_mm
+        tire_radius_mm = 1.125 * tire_width_mm
     else:
         tire_radius_mm = float(tire_radius_addition_mm)
     if tire_radius_mm < 0.0:
@@ -2893,9 +2894,9 @@ if __name__ == "__main__":
     print("  • Improved surface quality and aerodynamic performance")
     print("")
     tire_width = 32.0
-    spine_thickness = 12.0
-    louver_extra_margin = 4.0
-    louver_length = (tire_width / 2.0) - (spine_thickness / 2.0) + louver_extra_margin
+    spine_thickness = tire_width / 2.0 - 2.0
+    louver_extra_margin = 5.0
+    louver_length = (tire_width / 2.0) + louver_extra_margin
     print(f"Using tire width: {tire_width}, louver extension {louver_length:.1f} mm")
 
     build_fender(
@@ -2903,8 +2904,8 @@ if __name__ == "__main__":
         tire_radius_addition_mm="auto",  # estimate tyre radius from width
         tire_width_mm=tire_width,         # mm tyre width
         radial_clearance_mm=5.0,  # mm clearance between tyre and spine
-        coverage_angle_deg=100.0,    # Rear coverage: 0° (top) to +100° (about 4:30 position)
-        forward_extension_deg=-60.0,  # Front coverage: -40° means 40° ahead of wheel top (10:30 position)
+        coverage_angle_deg=108.0,    # Rear coverage: 0° (top) to +100°
+        forward_extension_deg=-89.0,  # Front coverage: -40° means 40° ahead of wheel top
         front_airfoil_end_deg=20.0,  # End of front airfoil: 20° behind wheel top (wraps past crown)
         # Front airfoil thickness is now AUTO-CALCULATED from tire_width, clearance, and chord
         # The thickness is set to accommodate tire passage while maintaining good aerodynamics
@@ -2917,14 +2918,15 @@ if __name__ == "__main__":
         front_airfoil_kammback_start=0.70,  # Moved forward (from 0.75) to truncate where airfoil is naturally thicker
         front_wall_thickness_mm=3.0,
         front_airfoil_tire_clearance_mm=2.0,  # Tighter 2mm clearance (each side) for reduced frontal area
-        spine_width=8.0,       # mm radial width of spine cross‐section
+        spine_width=10.0,       # mm radial width of spine cross‐section
         spine_thickness=spine_thickness,   # mm vertical thickness of spine cross‐section (with a wider expected tire this can be wider)
         spine_segments=60,     # number of segments approximating the spine
         louver_length=louver_length,    # mm length of each louver extending to sides (bike width)
         louver_depth=12.0,      # mm radial depth of each louver (toward wheel)
         louver_spacing=-0.5,   # -0.5 = 50% overlap for tight spacing (blocks spray effectively)
         tip_fraction=0.2,      # fraction of length used for tapered tip
-        louver_thickness=3,    # mm thickness of louver blades (independent of spine)
+        louver_thickness=3.2,    # mm thickness of louver blades (independent of spine)
+        min_airfoil_thickness_mm=2.2,
         airfoil_mode=True,              # Use airfoil cross-sections
         airfoil_thickness_ratio=0.15,   # 15% thick - delays stall, better high-AOA performance
         airfoil_camber=0.02,            # 2% camber - reduced from 5% to minimize span-wise flow while maintaining spray deflection
