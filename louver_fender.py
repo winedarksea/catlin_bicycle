@@ -2905,7 +2905,7 @@ if __name__ == "__main__":
         tire_width_mm=tire_width,         # mm tyre width
         radial_clearance_mm=5.0,  # mm clearance between tyre and spine
         coverage_angle_deg=108.0,    # Rear coverage: 0° (top) to +100°
-        forward_extension_deg=-89.0,  # Front coverage: -40° means 40° ahead of wheel top
+        forward_extension_deg=-60.0,  # Front coverage: -40° means 40° ahead of wheel top, currently only works up to -89°
         front_airfoil_end_deg=20.0,  # End of front airfoil: 20° behind wheel top (wraps past crown)
         # Front airfoil thickness is now AUTO-CALCULATED from tire_width, clearance, and chord
         # The thickness is set to accommodate tire passage while maintaining good aerodynamics
