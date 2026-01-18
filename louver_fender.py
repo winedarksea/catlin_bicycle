@@ -276,6 +276,18 @@ def create_spine(
     faces: List[Tuple[int, int, int]] = []
     edge_vertex_cache: Dict[Tuple[int, int], int] = {}
 
+    def get_local_thickness(theta: float) -> float:
+        """Calculate spine thickness with a taper starting forward of 90 deg."""
+        # Taper thickness: start widening at ~77.5° extension (12.5° theta), full 2.0x by -90° (0° theta)
+        t_start = math.radians(12.5)
+        t_end = 0.0
+        if theta >= t_start:
+            return spine_thickness
+        if theta <= t_end:
+            return spine_thickness * 2.0
+        lerp = (t_start - theta) / (t_start - t_end)
+        return spine_thickness * (1.0 + lerp * 1.0)
+
     # Compute cross‐section vertices for each segment
     section_indices = []
     section_centers = []  # Track center positions for smoothing
@@ -286,11 +298,13 @@ def create_spine(
         centre = spine_centre_radius * n_dir
         section_centers.append(centre)
 
+        local_thickness = get_local_thickness(theta)
+
         # Four corners of the rectangular cross‐section
-        v0 = centre - (spine_width / 2.0) * n_dir - (spine_thickness / 2.0) * z_dir
-        v1 = centre - (spine_width / 2.0) * n_dir + (spine_thickness / 2.0) * z_dir
-        v2 = centre + (spine_width / 2.0) * n_dir + (spine_thickness / 2.0) * z_dir
-        v3 = centre + (spine_width / 2.0) * n_dir - (spine_thickness / 2.0) * z_dir
+        v0 = centre - (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
+        v1 = centre - (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
+        v2 = centre + (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
+        v3 = centre + (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
         base_idx = len(vertices)
         vertices.extend([v0.tolist(), v1.tolist(), v2.tolist(), v3.tolist()])
         section_indices.append((base_idx, base_idx + 1, base_idx + 2, base_idx + 3))
@@ -307,12 +321,19 @@ def create_spine(
             n_dir = np.array([math.cos(theta), math.sin(theta), 0.0])
             z_dir = np.array([0.0, 0.0, 1.0])
             
+            local_thickness = get_local_thickness(theta)
+            
             # Rebuild the four corners with smoothed center
             base_idx = i * 4
-            vertices_array[base_idx] = smooth_center - (spine_width / 2.0) * n_dir - (spine_thickness / 2.0) * z_dir
-            vertices_array[base_idx + 1] = smooth_center - (spine_width / 2.0) * n_dir + (spine_thickness / 2.0) * z_dir
-            vertices_array[base_idx + 2] = smooth_center + (spine_width / 2.0) * n_dir + (spine_thickness / 2.0) * z_dir
-            vertices_array[base_idx + 3] = smooth_center + (spine_width / 2.0) * n_dir - (spine_thickness / 2.0) * z_dir
+            vertices_array[base_idx] = smooth_center - (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
+            vertices_array[base_idx + 1] = smooth_center - (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
+            vertices_array[base_idx + 2] = smooth_center + (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
+            vertices_array[base_idx + 3] = smooth_center + (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
+            base_idx = i * 4
+            vertices_array[base_idx] = smooth_center - (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
+            vertices_array[base_idx + 1] = smooth_center - (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
+            vertices_array[base_idx + 2] = smooth_center + (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
+            vertices_array[base_idx + 3] = smooth_center + (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
         
         vertices = vertices_array.tolist()
 
@@ -2699,6 +2720,11 @@ def build_fender(
     gap_deg = max(front_louver_gap_deg, 0.0)
     front_airfoil_limit = clamp(front_airfoil_end_relative, 0.0, total_coverage_deg)
     front_airfoil_end_for_geometry = front_airfoil_limit
+
+    # Limit front airfoil extension to 90 degrees (relative angle 0 here is front-most point of total spine)
+    # This prevents the airfoil from wrapping under the front of the wheel which creates clipping issues.
+    front_airfoil_start_relative = max(0.0, abs(forward_extension_deg) - 90.0)
+    
     louver_activation_start = clamp(front_airfoil_limit + gap_deg, 0.0, total_coverage_deg)
 
     front_airfoil_vertices, front_airfoil_faces = create_front_airfoil(
@@ -2706,7 +2732,7 @@ def build_fender(
         spine_vertices=spine_vertices,
         thetas=thetas,
         theta_start=theta_start,
-        front_start_deg=0.0,
+        front_start_deg=front_airfoil_start_relative,
         front_end_deg=front_airfoil_end_for_geometry,
         fender_depth=fender_chord,
         fender_half_width=fender_thickness_half,
@@ -2816,8 +2842,11 @@ def build_fender(
     # --- Clip and cap the spine to match the front airfoil cut plane ---
     # The front airfoil uses a clip plane chosen for rim-cap stability; to prevent the
     # spine from protruding forward of that plane, we clip the spine separately here.
+    # ONLY apply this if the airfoil starts at the very beginning of the spine.
+    # If the airfoil starts later (e.g. extension > 90 deg), let the spine lead.
     clip_plane_y = infer_clip_plane_y(front_airfoil_vertices, front_airfoil_faces)
-    if clip_plane_y is not None and spine_vertices.size > 0 and spine_faces:
+    if (clip_plane_y is not None and spine_vertices.size > 0 and spine_faces and 
+        front_airfoil_start_relative < 1e-6):
         print(f"\n=== SPINE FRONT CLIP ===")
         print(f"  Clipping spine at Y={clip_plane_y:.4f} mm to match front airfoil cut")
         # Clip only the forward-most portion of the spine. A constant-y plane intersects
@@ -2905,10 +2934,8 @@ if __name__ == "__main__":
         tire_width_mm=tire_width,         # mm tyre width
         radial_clearance_mm=5.0,  # mm clearance between tyre and spine
         coverage_angle_deg=108.0,    # Rear coverage: 0° (top) to +100°
-        forward_extension_deg=-60.0,  # Front coverage: -40° means 40° ahead of wheel top, currently only works up to -89°
+        forward_extension_deg=-60.0,  # Front coverage: -120° means 120° ahead of wheel top. Currently it just has a "tail" for anything past -90
         front_airfoil_end_deg=20.0,  # End of front airfoil: 20° behind wheel top (wraps past crown)
-        # Front airfoil thickness is now AUTO-CALCULATED from tire_width, clearance, and chord
-        # The thickness is set to accommodate tire passage while maintaining good aerodynamics
         front_airfoil_chord_mm=98.0,  # Increased from 70mm to improve thickness ratio (aerodynamics)
         front_airfoil_thickness_ratio=0.18,  # Target 18% t/c ratio
         front_airfoil_design_speed_kmh=50.0,  # Design for 50 km/h cruise speed
