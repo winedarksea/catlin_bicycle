@@ -206,6 +206,15 @@ def create_airfoil_profile(
     return upper_array, lower_array
 
 
+def build_airfoil_perimeter(upper: np.ndarray, lower: np.ndarray) -> np.ndarray:
+    """Return a closed airfoil perimeter with the leading edge included only once."""
+    if len(upper) == 0:
+        return np.zeros((0, 2), dtype=float)
+    if len(lower) <= 1:
+        return upper.copy()
+    return np.vstack([upper, lower[:0:-1]])
+
+
 def rotate_vector(v: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
     """Rotate vector v around axis by angle (radians) using Rodrigues' formula."""
     # Ensure axis is unit length
@@ -1810,6 +1819,7 @@ def create_louvers_pair(
 
         # Determine which sides to generate (±Z direction, parallel to hub axis)
         side_signs = (+1.0, -1.0) if both_sides else (+1.0,)
+        shared_root_section: Optional[List[int]] = None
 
         arc_deg = math.degrees(theta - theta_start)
         if arc_deg < start_angle_clamped - 1e-6 or arc_deg > end_angle_clamped + 1e-6:
@@ -1885,6 +1895,10 @@ def create_louvers_pair(
             
             if airfoil_mode:
                 for t_val, sc in zip(ts, scale_factors):
+                    if both_sides and shared_root_section is not None and abs(t_val) <= 1e-9:
+                        cs_idx.append(shared_root_section)
+                        continue
+
                     centre = base_mid + extrude_dir * t_val
                     # Scale the louver depth (chord) for taper
                     scaled_depth = louver_depth * sc
@@ -1907,22 +1921,18 @@ def create_louvers_pair(
                             n_points=airfoil_points,
                             kammback_start=kammback_local,
                         )
+                        perimeter = build_airfoil_perimeter(upper, lower)
                         
                         # Transform airfoil points to 3D louver position
                         section_vertices = []
                         
-                        # Upper surface points
-                        for pt in upper:
+                        for pt in perimeter:
                             pos_3d = centre + radial_dir * (scaled_depth - pt[0]) + vertical_dir * pt[1]
                             vertices.append(pos_3d.tolist())
                             section_vertices.append(len(vertices) - 1)
                         
-                        # Lower surface points in reverse
-                        for pt in reversed(lower):
-                            pos_3d = centre + radial_dir * (scaled_depth - pt[0]) + vertical_dir * pt[1]
-                            vertices.append(pos_3d.tolist())
-                            section_vertices.append(len(vertices) - 1)
-                        
+                        if both_sides and shared_root_section is None and abs(t_val) <= 1e-9:
+                            shared_root_section = section_vertices
                         cs_idx.append(section_vertices)
                     else:
                         # Very small chord at extreme tip - create minimal blunt cap
@@ -1933,10 +1943,17 @@ def create_louvers_pair(
                             (centre + vertical_dir * half_thick).tolist(),
                             (centre - vertical_dir * half_thick).tolist(),
                         ])
-                        cs_idx.append([base_idx, base_idx + 1])
+                        section_vertices = [base_idx, base_idx + 1]
+                        if both_sides and shared_root_section is None and abs(t_val) <= 1e-9:
+                            shared_root_section = section_vertices
+                        cs_idx.append(section_vertices)
             else:
                 # Rectangular cross-sections
                 for t_val, sc in zip(ts, scale_factors):
+                    if both_sides and shared_root_section is not None and abs(t_val) <= 1e-9:
+                        cs_idx.append(shared_root_section)
+                        continue
+
                     centre = base_mid + extrude_dir * t_val
                     v_scale = actual_louver_thickness * sc
                     if min_airfoil_thickness_mm is not None:
@@ -1958,7 +1975,10 @@ def create_louvers_pair(
                         inner_top.tolist(),
                         inner_bottom.tolist(),
                     ])
-                    cs_idx.append([base_idx, base_idx + 1, base_idx + 2, base_idx + 3])
+                    section_vertices = [base_idx, base_idx + 1, base_idx + 2, base_idx + 3]
+                    if both_sides and shared_root_section is None and abs(t_val) <= 1e-9:
+                        shared_root_section = section_vertices
+                    cs_idx.append(section_vertices)
             
             # Build faces between consecutive cross‑sections
             for i in range(len(cs_idx) - 1):
@@ -2010,7 +2030,7 @@ def create_louvers_pair(
                                 faces.append((v0, v2, v1))
             
             # Cap the base and tip
-            if cs_idx and len(cs_idx[0]) > 2:
+            if cs_idx and len(cs_idx[0]) > 2 and not both_sides:
                 verts = cs_idx[0]
                 for k in range(1, len(verts) - 1):
                     faces.append((verts[0], verts[k], verts[k + 1]))
