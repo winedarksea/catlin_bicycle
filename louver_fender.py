@@ -36,6 +36,14 @@ except ImportError:
     pv = None
     HAS_PYVISTA = False
 
+try:
+    from shapely import Polygon as ShapelyPolygon, constrained_delaunay_triangles
+    HAS_SHAPELY = True
+except Exception:  # pragma: no cover - optional dependency for constrained front-cap triangulation
+    ShapelyPolygon = None
+    constrained_delaunay_triangles = None
+    HAS_SHAPELY = False
+
 
 def gaussian_smooth_5point(points: np.ndarray, iterations: int = 1) -> np.ndarray:
     """Apply 5-point Gaussian smoothing to a series of points.
@@ -942,6 +950,9 @@ def build_plane_rim_cap_faces(
     y_plane: float,
     base_vertex_count: int,
     intersection_edge_cache: Dict[Tuple[int, int], int],
+    base_vertex_offset: int = 0,
+    interior_hole_loops: Optional[List[List[int]]] = None,
+    boundary_seed_vertices: Optional[Set[int]] = None,
     keep_above: bool = True,
     eps: float = 1e-6,
     endpoint_merge_tol_mm: float = 0.5,
@@ -973,14 +984,19 @@ def build_plane_rim_cap_faces(
 
     def vertex_kind(idx: int) -> Optional[str]:
         """Classify a vertex as 'outer' or 'inner' based on its index pattern."""
-        if idx < base_vertex_count:
-            return "outer" if (idx % 4) in (0, 2) else "inner"
+        if base_vertex_offset <= idx < (base_vertex_offset + base_vertex_count):
+            local_idx = idx - base_vertex_offset
+            return "outer" if (local_idx % 4) in (0, 2) else "inner"
         src = intersection_sources.get(idx)
         if src is None:
             return None
         u, v = src
-        ku = "outer" if (u % 4) in (0, 2) else "inner"
-        kv = "outer" if (v % 4) in (0, 2) else "inner"
+        if not (base_vertex_offset <= u < (base_vertex_offset + base_vertex_count)):
+            return None
+        if not (base_vertex_offset <= v < (base_vertex_offset + base_vertex_count)):
+            return None
+        ku = "outer" if ((u - base_vertex_offset) % 4) in (0, 2) else "inner"
+        kv = "outer" if ((v - base_vertex_offset) % 4) in (0, 2) else "inner"
         return ku if ku == kv else None
 
     # Find boundary edges on the clip plane
@@ -994,14 +1010,18 @@ def build_plane_rim_cap_faces(
 
     # Only consider boundary edges that:
     # 1. Are on the clip plane
-    # 2. Include at least one intersection vertex (from the clipped front section)
+    # 2. Belong to the front-most clipped section, identified either by a newly
+    #    created intersection vertex or by an original section-0 vertex that
+    #    already lies on the clip plane.
+    allowed_boundary_vertices: Set[int] = set(intersection_vertex_set)
+    if boundary_seed_vertices:
+        allowed_boundary_vertices.update(boundary_seed_vertices)
     plane_boundary_edges: List[Tuple[int, int]] = []
     for (u, v), count in edge_counts.items():
         if count != 1:
             continue
         if abs(vertices[u][1] - y_plane) <= eps and abs(vertices[v][1] - y_plane) <= eps:
-            # KEY FILTER: At least one vertex must be an intersection vertex
-            if u in intersection_vertex_set or v in intersection_vertex_set:
+            if u in allowed_boundary_vertices and v in allowed_boundary_vertices:
                 plane_boundary_edges.append((u, v))
 
     if not plane_boundary_edges:
@@ -1084,16 +1104,26 @@ def build_plane_rim_cap_faces(
 
         return chains_local
 
-    outer_chains = _merge_chains_by_endpoint_proximity(
-        vertices,
-        chains_from_edges(outer_edges),
-        tol_mm=endpoint_merge_tol_mm,
-    )
-    inner_chains = _merge_chains_by_endpoint_proximity(
-        vertices,
-        chains_from_edges(inner_edges),
-        tol_mm=endpoint_merge_tol_mm,
-    )
+    raw_outer_chains = chains_from_edges(outer_edges)
+    raw_inner_chains = chains_from_edges(inner_edges)
+
+    # When the clip already yields balanced open chains, preserve them as-is.
+    # Merging opposite-side chains at the trailing edge can create a self-
+    # intersecting strip and make half of the front horseshoe cap disappear.
+    if raw_outer_chains and raw_inner_chains and len(raw_outer_chains) == len(raw_inner_chains):
+        outer_chains = raw_outer_chains
+        inner_chains = raw_inner_chains
+    else:
+        outer_chains = _merge_chains_by_endpoint_proximity(
+            vertices,
+            raw_outer_chains,
+            tol_mm=endpoint_merge_tol_mm,
+        )
+        inner_chains = _merge_chains_by_endpoint_proximity(
+            vertices,
+            raw_inner_chains,
+            tol_mm=endpoint_merge_tol_mm,
+        )
 
     if not outer_chains or not inner_chains:
         return []
@@ -1148,6 +1178,137 @@ def build_plane_rim_cap_faces(
             out_faces.append((a, c, b))
         else:
             out_faces.append((a, b, c))
+
+    def normalize_loop(loop: List[int]) -> List[int]:
+        normalized: List[int] = []
+        for idx in loop:
+            if not normalized or idx != normalized[-1]:
+                normalized.append(idx)
+        if len(normalized) >= 2 and normalized[0] == normalized[-1]:
+            normalized.pop()
+        return normalized
+
+    def orient_loop_ccw(loop: List[int], expect_ccw: bool) -> List[int]:
+        if len(loop) < 3:
+            return loop
+        pts = np.array([[vertices[idx][0], vertices[idx][2]] for idx in loop])
+        area = polygon_area_2d(pts)
+        if expect_ccw and area < 0:
+            return list(reversed(loop))
+        if not expect_ccw and area > 0:
+            return list(reversed(loop))
+        return loop
+
+    def triangulate_pair_with_holes(
+        outer: List[int],
+        inner: List[int],
+        hole_loops: List[List[int]],
+    ) -> List[Tuple[int, int, int]]:
+        outer_start = vertices[outer[0]][[0, 2]]
+        outer_end = vertices[outer[-1]][[0, 2]]
+        inner_start = vertices[inner[0]][[0, 2]]
+        inner_end = vertices[inner[-1]][[0, 2]]
+
+        direct_cost = float(np.linalg.norm(outer_start - inner_end) + np.linalg.norm(outer_end - inner_start))
+        reversed_cost = float(np.linalg.norm(outer_start - inner_start) + np.linalg.norm(outer_end - inner_end))
+        strip_loop = normalize_loop(outer + (inner if direct_cost <= reversed_cost else list(reversed(inner))))
+        if len(strip_loop) < 3:
+            return []
+        strip_loop = orient_loop_ccw(strip_loop, expect_ccw=True)
+
+        usable_holes: List[List[int]] = []
+        for hole in hole_loops:
+            hole_norm = normalize_loop(hole)
+            if len(hole_norm) < 3:
+                continue
+            hole_norm = orient_loop_ccw(hole_norm, expect_ccw=False)
+            usable_holes.append(hole_norm)
+
+        outer_pts = np.array([[vertices[idx][0], vertices[idx][2]] for idx in strip_loop])
+        hole_pts = [np.array([[vertices[idx][0], vertices[idx][2]] for idx in loop]) for loop in usable_holes]
+        if HAS_SHAPELY:
+            coord_to_index: Dict[Tuple[float, float], int] = {}
+            for idx in strip_loop:
+                coord_to_index[(round(vertices[idx][0], 9), round(vertices[idx][2], 9))] = idx
+            for loop in usable_holes:
+                for idx in loop:
+                    coord_to_index[(round(vertices[idx][0], 9), round(vertices[idx][2], 9))] = idx
+
+            polygon = ShapelyPolygon(
+                [(float(x), float(z)) for x, z in outer_pts],
+                holes=[[(float(x), float(z)) for x, z in pts] for pts in hole_pts],
+            )
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+            if not polygon.is_empty:
+                triangles = constrained_delaunay_triangles(polygon)
+                geoms = list(triangles.geoms) if hasattr(triangles, "geoms") else [triangles]
+                out_faces: List[Tuple[int, int, int]] = []
+                for tri in geoms:
+                    if tri.is_empty:
+                        continue
+                    coords = list(tri.exterior.coords)[:-1]
+                    if len(coords) != 3:
+                        continue
+                    tri_indices: List[int] = []
+                    missing_boundary_vertex = False
+                    for x, z in coords:
+                        key = (round(float(x), 9), round(float(z), 9))
+                        idx = coord_to_index.get(key)
+                        if idx is None:
+                            missing_boundary_vertex = True
+                            break
+                        tri_indices.append(idx)
+                    if missing_boundary_vertex:
+                        out_faces = []
+                        break
+                    add_oriented_face(out_faces, (tri_indices[0], tri_indices[1], tri_indices[2]))
+                if out_faces:
+                    return out_faces
+
+        _, cap_faces = triangulate_with_holes(outer_pts, hole_pts)
+        if len(cap_faces) == 0:
+            return []
+
+        cap_vertex_indices = strip_loop + [idx for loop in usable_holes for idx in loop]
+        out_faces: List[Tuple[int, int, int]] = []
+        for tri in cap_faces:
+            add_oriented_face(
+                out_faces,
+                (
+                    cap_vertex_indices[int(tri[0])],
+                    cap_vertex_indices[int(tri[1])],
+                    cap_vertex_indices[int(tri[2])],
+                ),
+            )
+        return out_faces
+
+    if interior_hole_loops is not None:
+        hole_loops_norm = [normalize_loop(loop) for loop in interior_hole_loops if len(normalize_loop(loop)) >= 3]
+        pair_holes: List[List[List[int]]] = [[] for _ in pairs]
+        pair_polygons: List[np.ndarray] = []
+        for outer, inner in pairs:
+            loop = normalize_loop(outer + list(reversed(inner)))
+            pts = np.array([[vertices[idx][0], vertices[idx][2]] for idx in loop]) if len(loop) >= 3 else np.zeros((0, 2))
+            pair_polygons.append(pts)
+
+        for hole in hole_loops_norm:
+            hole_pts = np.array([[vertices[idx][0], vertices[idx][2]] for idx in hole])
+            centroid = np.mean(hole_pts, axis=0)
+            assigned = False
+            for pair_idx, poly in enumerate(pair_polygons):
+                if len(poly) >= 3 and point_in_polygon(centroid, poly):
+                    pair_holes[pair_idx].append(hole)
+                    assigned = True
+                    break
+            if not assigned and len(pair_holes) == 1:
+                pair_holes[0].append(hole)
+
+        cap_faces: List[Tuple[int, int, int]] = []
+        for pair_idx, (outer, inner) in enumerate(pairs):
+            cap_faces.extend(triangulate_pair_with_holes(outer, inner, pair_holes[pair_idx]))
+        if cap_faces:
+            return cap_faces
 
     cap_faces: List[Tuple[int, int, int]] = []
     for outer, inner in pairs:
@@ -1251,14 +1412,21 @@ def create_front_airfoil(
     airfoil_thickness_mm: Optional[float] = None,
     chord_length_mm: Optional[float] = None,
     wall_thickness_mm: float = 3.0,
-) -> Tuple[np.ndarray, List[Tuple[int, int, int]]]:
+) -> Tuple[np.ndarray, List[Tuple[int, int, int]], Dict[str, object]]:
     """
     Create a hollow Kammback airfoil, with the front section truncated parallel
     to the ground plane using exact geometric plane intersection for a perfectly
     flat, watertight front cap.
     """
+    metadata: Dict[str, object] = {
+        "clip_plane_y": None,
+        "base_vertex_count": 0,
+        "front_section_edge_cache": {},
+        "front_cap_face_count": 0,
+        "front_section_vertex_indices": set(),
+    }
     if fender_depth <= 1e-6 or fender_half_width <= 0.0:
-        return np.zeros((0, 3)), []
+        return np.zeros((0, 3)), [], metadata
 
     # Section setup code
     front_start = max(0.0, front_start_deg)
@@ -1269,7 +1437,7 @@ def create_front_airfoil(
         idx for idx, deg in enumerate(arc_degrees) if front_start - 1e-6 <= deg <= front_end + 1e-6
     ]
     if len(valid_indices) < 2:
-        return np.zeros((0, 3)), []
+        return np.zeros((0, 3)), [], metadata
 
     actual_chord_length = chord_length_mm if chord_length_mm is not None else fender_depth
     effective_thickness_ratio = airfoil_thickness_ratio
@@ -1379,13 +1547,17 @@ def create_front_airfoil(
         unclipped_loops.append(loops)
     
     if not unclipped_loops: 
-        return np.zeros((0, 3)), []
+        return np.zeros((0, 3)), [], metadata
     
     unclipped_vertices_np = np.array(unclipped_vertices)
     base_vertex_count = int(unclipped_vertices_np.shape[0])
+    metadata["base_vertex_count"] = base_vertex_count
 
     # --- Part 2: Determine clipping plane from the HIGHEST leading edge point ---
     front_loops = unclipped_loops[0]
+    metadata["front_section_vertex_indices"] = {
+        idx for loop in front_loops.values() for idx in loop
+    }
     leading_edge_y_values = []
     leading_edge_labels = ["outer_neg", "outer_pos", "inner_neg", "inner_pos"]
     for key in leading_edge_labels:
@@ -1396,6 +1568,7 @@ def create_front_airfoil(
     # through the airfoil on BOTH span sides, creating a complete horseshoe cap.
     # (Using minimum only clips one side when the airfoil is tilted.)
     y_clip_plane = max(leading_edge_y_values)
+    metadata["clip_plane_y"] = float(y_clip_plane)
     
     print(f"\n=== GEOMETRIC PLANE INTERSECTION ===")
     print(f"  Leading edge Y values:")
@@ -1427,10 +1600,6 @@ def create_front_airfoil(
     # Cache for edge-plane intersection vertices to keep shared edges watertight
     edge_vertex_cache: Dict[Tuple[int, int], int] = {}
     
-    # Separate cache for ONLY the front section (section 0) intersections
-    # This is used to build the horseshoe cap without picking up edges from other sections
-    front_section_edge_cache: Dict[Tuple[int, int], int] = {}
-
     # --- Part 4: Build wall faces between sections (with triangle clipping) ---
     print(f"  Clipping wall faces...")
     clipped_face_count = 0
@@ -1470,11 +1639,6 @@ def create_front_airfoil(
                         clipped_face_count += 1
                     for tri in clipped:
                         _add_face_if_valid(tri, faces)
-        
-        # Capture intersection vertices from section 0 (front section) only
-        if sec == 0:
-            for edge_key, v_idx in edge_vertex_cache.items():
-                front_section_edge_cache[edge_key] = v_idx
     
     print(f"    Total faces processed: {total_face_count}, clipped: {clipped_face_count}")
     
@@ -1511,7 +1675,7 @@ def create_front_airfoil(
     # --- Part 7: Add front cap ring between outer and inner shells ---
     # Now that the clip plane is at the MAXIMUM leading edge Y, both span sides
     # are clipped, creating a complete horseshoe of intersection vertices.
-    print(f"  Front section edge cache: {len(front_section_edge_cache)} intersection vertices")
+    print(f"  Front clip edge cache: {len(edge_vertex_cache)} intersection vertices")
     
     front_cap_faces: List[Tuple[int, int, int]] = []
     try:
@@ -1520,7 +1684,8 @@ def create_front_airfoil(
             faces,
             y_clip_plane,
             base_vertex_count=base_vertex_count,
-            intersection_edge_cache=front_section_edge_cache,  # Use ONLY front section intersections
+            intersection_edge_cache=edge_vertex_cache,
+            boundary_seed_vertices=set(metadata["front_section_vertex_indices"]),
             keep_above=True,
             eps=PLANE_SNAP_EPS,
         )
@@ -1538,10 +1703,12 @@ def create_front_airfoil(
 
     if front_cap_faces:
         faces.extend(front_cap_faces)
+        metadata["front_cap_face_count"] = len(front_cap_faces)
         print(f"  Front cap faces: {len(front_cap_faces)}")
 
+    metadata["front_section_edge_cache"] = dict(edge_vertex_cache)
     print(f"  Total faces generated: {len(faces)}")
-    return final_vertices, faces
+    return final_vertices, faces, metadata
 
 
 def create_louvers_pair(
@@ -2747,7 +2914,7 @@ def build_fender(
     
     louver_activation_start = clamp(front_airfoil_limit + gap_deg, 0.0, total_coverage_deg)
 
-    front_airfoil_vertices, front_airfoil_faces = create_front_airfoil(
+    front_airfoil_vertices, front_airfoil_faces, front_airfoil_metadata = create_front_airfoil(
         section_indices=seg_indices,
         spine_vertices=spine_vertices,
         thetas=thetas,
@@ -2907,18 +3074,67 @@ def build_fender(
                 spine_faces = list(spine_faces) + spine_cap_faces
                 print(f"  Spine clip cap faces: {len(spine_cap_faces)}")
         print(f"=== END SPINE FRONT CLIP ===\n")
-    # Concatenate vertices and faces, offset each component appropriately
+    # Concatenate vertices and faces, offset each component appropriately.
     combined_vertices: List[np.ndarray] = [spine_vertices]
     combined_faces: List[Tuple[int, int, int]] = list(spine_faces)
     running_offset = len(spine_vertices)
+    front_offset = running_offset
 
     if front_airfoil_vertices.size > 0:
+        front_cap_face_count = int(front_airfoil_metadata.get("front_cap_face_count", 0))
+        front_base_faces = (
+            front_airfoil_faces[:-front_cap_face_count]
+            if front_cap_face_count > 0
+            else list(front_airfoil_faces)
+        )
         combined_vertices.append(front_airfoil_vertices)
         combined_faces.extend(
-            (a + running_offset, b + running_offset, c + running_offset)
-            for (a, b, c) in front_airfoil_faces
+            (a + front_offset, b + front_offset, c + front_offset)
+            for (a, b, c) in front_base_faces
         )
         running_offset += len(front_airfoil_vertices)
+
+        rebuilt_front_cap_faces: List[Tuple[int, int, int]] = []
+        front_cache_local = front_airfoil_metadata.get("front_section_edge_cache", {})
+        if (
+            clip_plane_y is not None
+            and front_cap_face_count > 0
+            and isinstance(front_cache_local, dict)
+        ):
+            try:
+                front_cache_combined = {
+                    (u + front_offset, v + front_offset): idx + front_offset
+                    for (u, v), idx in front_cache_local.items()
+                }
+                front_seed_vertices_combined = {
+                    idx + front_offset
+                    for idx in front_airfoil_metadata.get("front_section_vertex_indices", set())
+                }
+                spine_plus_front_vertices = np.vstack(combined_vertices)
+                rebuilt_front_cap_faces = build_plane_rim_cap_faces(
+                    spine_plus_front_vertices,
+                    combined_faces,
+                    clip_plane_y,
+                    base_vertex_count=int(front_airfoil_metadata.get("base_vertex_count", 0)),
+                    intersection_edge_cache=front_cache_combined,
+                    base_vertex_offset=front_offset,
+                    interior_hole_loops=[],
+                    boundary_seed_vertices=front_seed_vertices_combined,
+                    keep_above=True,
+                    eps=1e-6,
+                )
+            except RuntimeError as exc:
+                rebuilt_front_cap_faces = []
+                print(f"  Front cap rebuild skipped: {exc}")
+
+        if rebuilt_front_cap_faces:
+            combined_faces.extend(rebuilt_front_cap_faces)
+            print(f"  Front cap rebuild faces: {len(rebuilt_front_cap_faces)}")
+        elif front_cap_face_count > 0:
+            combined_faces.extend(
+                (a + front_offset, b + front_offset, c + front_offset)
+                for (a, b, c) in front_airfoil_faces[-front_cap_face_count:]
+            )
 
     if louver_vertices.size > 0:
         combined_vertices.append(louver_vertices)
