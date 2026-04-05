@@ -1986,7 +1986,6 @@ def create_louvers_pair(
 
         # Determine which sides to generate (±Z direction, parallel to hub axis)
         side_signs = (+1.0, -1.0) if both_sides else (+1.0,)
-        shared_root_section: Optional[List[int]] = None
 
         arc_deg = math.degrees(theta - theta_start)
         if arc_deg < start_angle_clamped - 1e-6 or arc_deg > end_angle_clamped + 1e-6:
@@ -2062,10 +2061,6 @@ def create_louvers_pair(
             
             if airfoil_mode:
                 for t_val, sc in zip(ts, scale_factors):
-                    if both_sides and shared_root_section is not None and abs(t_val) <= 1e-9:
-                        cs_idx.append(shared_root_section)
-                        continue
-
                     centre = base_mid + extrude_dir * t_val
                     # Scale the louver depth (chord) for taper
                     scaled_depth = louver_depth * sc
@@ -2088,18 +2083,22 @@ def create_louvers_pair(
                             n_points=airfoil_points,
                             kammback_start=kammback_local,
                         )
-                        perimeter = build_airfoil_perimeter(upper, lower)
                         
                         # Transform airfoil points to 3D louver position
                         section_vertices = []
                         
-                        for pt in perimeter:
+                        # Upper surface points
+                        for pt in upper:
                             pos_3d = centre + radial_dir * (scaled_depth - pt[0]) + vertical_dir * pt[1]
                             vertices.append(pos_3d.tolist())
                             section_vertices.append(len(vertices) - 1)
                         
-                        if both_sides and shared_root_section is None and abs(t_val) <= 1e-9:
-                            shared_root_section = section_vertices
+                        # Lower surface points in reverse
+                        for pt in reversed(lower):
+                            pos_3d = centre + radial_dir * (scaled_depth - pt[0]) + vertical_dir * pt[1]
+                            vertices.append(pos_3d.tolist())
+                            section_vertices.append(len(vertices) - 1)
+                        
                         cs_idx.append(section_vertices)
                     else:
                         # Very small chord at extreme tip - create minimal blunt cap
@@ -2111,16 +2110,10 @@ def create_louvers_pair(
                             (centre - vertical_dir * half_thick).tolist(),
                         ])
                         section_vertices = [base_idx, base_idx + 1]
-                        if both_sides and shared_root_section is None and abs(t_val) <= 1e-9:
-                            shared_root_section = section_vertices
                         cs_idx.append(section_vertices)
             else:
                 # Rectangular cross-sections
                 for t_val, sc in zip(ts, scale_factors):
-                    if both_sides and shared_root_section is not None and abs(t_val) <= 1e-9:
-                        cs_idx.append(shared_root_section)
-                        continue
-
                     centre = base_mid + extrude_dir * t_val
                     v_scale = actual_louver_thickness * sc
                     if min_airfoil_thickness_mm is not None:
@@ -2143,8 +2136,6 @@ def create_louvers_pair(
                         inner_bottom.tolist(),
                     ])
                     section_vertices = [base_idx, base_idx + 1, base_idx + 2, base_idx + 3]
-                    if both_sides and shared_root_section is None and abs(t_val) <= 1e-9:
-                        shared_root_section = section_vertices
                     cs_idx.append(section_vertices)
             
             # Build faces between consecutive cross‑sections
@@ -2336,7 +2327,7 @@ def write_stl(
     filename: str,
     vertices: np.ndarray,
     faces: List[Tuple[int, int, int]],
-    validate_and_repair: bool = True,
+    validate_and_repair: bool = False,
 ) -> None:
     """Write vertices and faces to a binary STL file.
     
@@ -2349,60 +2340,11 @@ def write_stl(
     faces : List[Tuple[int, int, int]]
         List of triangle faces as vertex index tuples.
     validate_and_repair : bool
-        If True and PyVista is available, validate mesh quality and
-        attempt to repair any issues (fill holes, clean duplicates).
+        If True and PyVista is available, print mesh diagnostics.
+        STL output is still written from the original triangles to avoid
+        topology changes from automated repair filters.
     """
-    if validate_and_repair and HAS_PYVISTA:
-        # Build PyVista mesh from faces
-        pv_faces = []
-        for tri in faces:
-            pv_faces.extend([3, int(tri[0]), int(tri[1]), int(tri[2])])
-        pv_faces = np.array(pv_faces, dtype=np.int64)
-        mesh = pv.PolyData(vertices.astype(np.float64), faces=pv_faces)
-        
-        # Clean mesh (merge duplicate points, remove degenerate cells)
-        mesh = mesh.clean(tolerance=1e-6)
-        
-        # Check initial state
-        print(f"\n=== MESH VALIDATION ===")
-        print(f"  Initial: {mesh.n_points} points, {mesh.n_cells} cells")
-        
-        if mesh.n_points == 0 or mesh.n_cells == 0:
-            print(f"  WARNING: Empty mesh, skipping validation")
-            print(f"=== END MESH VALIDATION ===\n")
-            mesh.save(filename)
-            return
-        
-        print(f"  Is manifold: {mesh.is_manifold}")
-        print(f"  Open edges: {mesh.n_open_edges}")
-        
-        # Check connectivity
-        conn = mesh.connectivity()
-        n_regions = len(set(conn.point_data['RegionId']))
-        print(f"  Connected regions: {n_regions}")
-        
-        # Attempt to fill holes if not watertight
-        if mesh.n_open_edges > 0:
-            print(f"  Attempting hole fill...")
-            mesh = mesh.fill_holes(hole_size=1000.0)
-            mesh = mesh.clean(tolerance=1e-6)
-            print(f"  After repair: {mesh.n_open_edges} open edges")
-        
-        # Final triangulation and cleanup
-        mesh = mesh.triangulate().clean()
-        
-        # Final validation
-        is_watertight = mesh.n_open_edges == 0
-        print(f"  Final: {mesh.n_points} points, {mesh.n_cells} cells")
-        print(f"  Watertight: {is_watertight}")
-        if not is_watertight:
-            print(f"  WARNING: Mesh still has {mesh.n_open_edges} open edges")
-        print(f"=== END MESH VALIDATION ===\n")
-        
-        # Save using PyVista
-        mesh.save(filename)
-    else:
-        # Original binary STL writer
+    def write_binary_from_faces() -> None:
         with open(filename, "wb") as f:
             # 80 byte header
             header_text = "Bicycle fender mesh generated by script"
@@ -2430,6 +2372,45 @@ def write_stl(
                 f.write(p2.astype(np.float32).tobytes())
                 # Attribute byte count (2 bytes)
                 f.write((0).to_bytes(2, byteorder="little"))
+
+    if validate_and_repair and HAS_PYVISTA:
+        # Build PyVista mesh from faces (diagnostics only)
+        pv_faces = []
+        for tri in faces:
+            pv_faces.extend([3, int(tri[0]), int(tri[1]), int(tri[2])])
+        pv_faces = np.array(pv_faces, dtype=np.int64)
+        mesh = pv.PolyData(vertices.astype(np.float64), faces=pv_faces)
+
+        # Check initial state
+        print(f"\n=== MESH VALIDATION ===")
+        print(f"  Initial: {mesh.n_points} points, {mesh.n_cells} cells")
+        
+        if mesh.n_points == 0 or mesh.n_cells == 0:
+            print(f"  WARNING: Empty mesh, skipping validation")
+            print(f"=== END MESH VALIDATION ===\n")
+            write_binary_from_faces()
+            return
+        
+        print(f"  Is manifold: {mesh.is_manifold}")
+        print(f"  Open edges: {mesh.n_open_edges}")
+        
+        # Check connectivity
+        conn = mesh.connectivity()
+        n_regions = len(set(conn.point_data['RegionId']))
+        print(f"  Connected regions: {n_regions}")
+
+        # Final validation
+        is_watertight = mesh.n_open_edges == 0
+        print(f"  Final: {mesh.n_points} points, {mesh.n_cells} cells")
+        print(f"  Watertight: {is_watertight}")
+        if not is_watertight:
+            print(f"  WARNING: Mesh still has {mesh.n_open_edges} open edges")
+        print(f"=== END MESH VALIDATION ===\n")
+
+        # Always write original triangles to preserve intended topology.
+        write_binary_from_faces()
+    else:
+        write_binary_from_faces()
 
 
 def build_single_louver(
@@ -2688,7 +2669,7 @@ def build_fender(
     spine_segments: int = 50,
     louver_length: float = 40.0,
     louver_depth: float = 15.0,
-    louver_spacing: float = -0.5,
+    louver_spacing: float = -0.0,
     tip_fraction: float = 0.2,
     output_filename: str = "louver_fender.stl",
     both_sides: bool = True,
