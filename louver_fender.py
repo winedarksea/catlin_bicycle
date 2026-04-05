@@ -2257,9 +2257,61 @@ def create_louvers_pair(
                     
                     # Cap the fence edge
                     if len(upper_fence_verts) > 0 and len(lower_fence_verts) > 0:
-                        all_fence_edge = upper_fence_verts + lower_fence_verts
+                        # Reverse lower_fence_verts so the perimeter goes:
+                        # LE-upper → TE-upper → TE-lower → LE-lower (a proper closed loop).
+                        # Without the reversal the loop jumps TE-upper → LE-lower, creating a
+                        # twisted cap and leaving the closing edge as an open boundary.
+                        all_fence_edge = upper_fence_verts + lower_fence_verts[::-1]
                         for i in range(1, len(all_fence_edge) - 1):
                             faces.append((all_fence_edge[0], all_fence_edge[i], all_fence_edge[i + 1]))
+
+                        # LE end cap — closes the leading-edge side of the fin.
+                        # Connects the two base vertices near the LE to their tip offsets.
+                        le_base_upper = fence_verts[upper_start]    # LE vertex (index 0)
+                        le_base_lower = fence_verts[lower_start]    # near-LE on lower surface
+                        le_tip_upper = upper_fence_verts[0]
+                        le_tip_lower = lower_fence_verts[0]
+
+                        # Outward normal for LE cap points toward the leading edge.
+                        p_le = np.array(vertices[le_base_upper])
+                        p_te_ref = np.array(vertices[fence_verts[upper_end - 1]])
+                        le_dir = p_le - p_te_ref
+
+                        for tri in [
+                            (le_base_upper, le_tip_upper, le_tip_lower),
+                            (le_base_upper, le_tip_lower, le_base_lower),
+                        ]:
+                            p0 = np.array(vertices[tri[0]])
+                            p1 = np.array(vertices[tri[1]])
+                            p2 = np.array(vertices[tri[2]])
+                            normal = np.cross(p1 - p0, p2 - p0)
+                            if np.dot(normal, le_dir) < 0:
+                                faces.append((tri[0], tri[2], tri[1]))
+                            else:
+                                faces.append(tri)
+
+                        # TE-chord end cap — closes the chordwise-cutoff side of the fin.
+                        # Connects the last upper/lower base vertices to their tip offsets.
+                        te_base_upper = fence_verts[upper_end - 1]
+                        te_base_lower = fence_verts[lower_end + 1]
+                        te_tip_upper = upper_fence_verts[-1]
+                        te_tip_lower = lower_fence_verts[-1]
+
+                        # Outward normal for TE cap points away from the leading edge.
+                        te_dir = p_te_ref - p_le
+
+                        for tri in [
+                            (te_base_upper, te_tip_upper, te_tip_lower),
+                            (te_base_upper, te_tip_lower, te_base_lower),
+                        ]:
+                            p0 = np.array(vertices[tri[0]])
+                            p1 = np.array(vertices[tri[1]])
+                            p2 = np.array(vertices[tri[2]])
+                            normal = np.cross(p1 - p0, p2 - p0)
+                            if np.dot(normal, te_dir) < 0:
+                                faces.append((tri[0], tri[2], tri[1]))
+                            else:
+                                faces.append(tri)
                 
                 elif not airfoil_mode and len(fence_verts) == 4:
                     # Rectangular fence
