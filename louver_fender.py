@@ -223,6 +223,20 @@ def build_airfoil_perimeter(upper: np.ndarray, lower: np.ndarray) -> np.ndarray:
     return np.vstack([upper, lower[:0:-1]])
 
 
+def wrap_section_range(start_idx: int, end_idx: int, count: int) -> List[int]:
+    """Return circular indices from start_idx to end_idx inclusive."""
+    if count <= 0:
+        return []
+    start = int(start_idx) % count
+    end = int(end_idx) % count
+    indices = [start]
+    cur = start
+    while cur != end:
+        cur = (cur + 1) % count
+        indices.append(cur)
+    return indices
+
+
 def add_face_if_valid(
     face_list: List[Tuple[int, int, int]],
     vertices: Union[List[List[float]], List[np.ndarray], np.ndarray],
@@ -948,6 +962,61 @@ def extract_plane_boundary_chains(
     return chains
 
 
+def extract_open_boundary_loops(
+    faces: List[Tuple[int, int, int]],
+) -> List[List[int]]:
+    """Extract closed loops from boundary edges in a triangle mesh."""
+    edge_counts: Counter = Counter()
+    for a, b, c in faces:
+        for u, v in ((a, b), (b, c), (c, a)):
+            if u == v:
+                continue
+            key = (u, v) if u < v else (v, u)
+            edge_counts[key] += 1
+
+    boundary_edges = [(u, v) for (u, v), count in edge_counts.items() if count == 1]
+    if not boundary_edges:
+        return []
+
+    adjacency: Dict[int, List[int]] = {}
+    for u, v in boundary_edges:
+        adjacency.setdefault(u, []).append(v)
+        adjacency.setdefault(v, []).append(u)
+
+    unused = {((u, v) if u < v else (v, u)) for u, v in boundary_edges}
+    loops: List[List[int]] = []
+    while unused:
+        u, v = unused.pop()
+        loop = [u, v]
+        prev, curr = u, v
+        while True:
+            neighbors = adjacency.get(curr, [])
+            nxt = None
+            for cand in neighbors:
+                if cand == prev:
+                    continue
+                edge_key = (cand, curr) if cand < curr else (curr, cand)
+                if edge_key in unused:
+                    nxt = cand
+                    break
+            if nxt is None:
+                if loop[0] in neighbors:
+                    loop.append(loop[0])
+                break
+            edge_key = (nxt, curr) if nxt < curr else (curr, nxt)
+            unused.discard(edge_key)
+            if nxt == loop[0]:
+                loop.append(nxt)
+                break
+            loop.append(nxt)
+            prev, curr = curr, nxt
+
+        if len(loop) >= 4 and loop[0] == loop[-1]:
+            loops.append(loop[:-1])
+
+    return loops
+
+
 def _merge_chains_by_endpoint_proximity(
     vertices: np.ndarray,
     chains: List[List[int]],
@@ -1447,6 +1516,172 @@ def build_plane_cap_faces(
             out_faces.append((a, c, b))
         else:
             out_faces.append((a, b, c))
+    return out_faces
+
+
+def build_constant_coordinate_loop_caps(
+    vertices: np.ndarray,
+    faces: List[Tuple[int, int, int]],
+    axis: int,
+    min_secondary_axis_value: Optional[float] = None,
+    coord_tol: float = 0.5,
+    area_eps: float = 1e-8,
+) -> List[Tuple[int, int, int]]:
+    """
+    Cap remaining open boundary loops that lie on an approximately constant plane.
+
+    This is used as a narrowly-scoped fallback for the front airfoil side seams:
+    only loops whose coordinate variance is tiny and that remain wholly in the
+    front-cap band are sealed.
+    """
+    loops = extract_open_boundary_loops(faces)
+    if not loops:
+        return []
+
+    keep_dims = [dim for dim in range(3) if dim != axis]
+    out_faces: List[Tuple[int, int, int]] = []
+
+    def add_oriented_face(tri: Tuple[int, int, int], target_sign: float) -> None:
+        a, b, c = tri
+        if a == b or b == c or a == c:
+            return
+        p0, p1, p2 = vertices[a], vertices[b], vertices[c]
+        nrm = np.cross(p1 - p0, p2 - p0)
+        if np.linalg.norm(nrm) <= area_eps:
+            return
+        if nrm[axis] * target_sign < 0:
+            out_faces.append((a, c, b))
+        else:
+            out_faces.append((a, b, c))
+
+    for loop in loops:
+        coords = vertices[loop]
+        axis_values = coords[:, axis]
+        if float(np.max(axis_values) - np.min(axis_values)) > coord_tol:
+            continue
+        if (
+            min_secondary_axis_value is not None
+            and float(np.min(coords[:, 1])) < float(min_secondary_axis_value) - coord_tol
+        ):
+            continue
+
+        pts_2d = coords[:, keep_dims]
+        if len(pts_2d) < 3:
+            continue
+
+        area_2d = abs(polygon_area_2d(pts_2d))
+        if area_2d <= area_eps:
+            key_to_indices: Dict[Tuple[float, float], List[int]] = {}
+            for idx in loop:
+                key = (
+                    round(float(vertices[idx][keep_dims[0]]), 9),
+                    round(float(vertices[idx][keep_dims[1]]), 9),
+                )
+                key_to_indices.setdefault(key, []).append(idx)
+
+            if not key_to_indices or any(len(indices) != 2 for indices in key_to_indices.values()):
+                continue
+
+            key_adjacency: Dict[Tuple[float, float], Set[Tuple[float, float]]] = {
+                key: set() for key in key_to_indices
+            }
+            for i in range(len(loop)):
+                key_u = (
+                    round(float(vertices[loop[i]][keep_dims[0]]), 9),
+                    round(float(vertices[loop[i]][keep_dims[1]]), 9),
+                )
+                key_v = (
+                    round(float(vertices[loop[(i + 1) % len(loop)]][keep_dims[0]]), 9),
+                    round(float(vertices[loop[(i + 1) % len(loop)]][keep_dims[1]]), 9),
+                )
+                if key_u != key_v:
+                    key_adjacency[key_u].add(key_v)
+                    key_adjacency[key_v].add(key_u)
+
+            endpoints = [key for key, neighbors in key_adjacency.items() if len(neighbors) == 1]
+            start_key = endpoints[0] if endpoints else next(iter(key_adjacency))
+            ordered_keys = [start_key]
+            prev_key = None
+            curr_key = start_key
+            visited_key_edges: Set[Tuple[Tuple[float, float], Tuple[float, float]]] = set()
+            while True:
+                nxt = None
+                for cand in key_adjacency[curr_key]:
+                    edge_key = tuple(sorted((curr_key, cand)))
+                    if cand != prev_key and edge_key not in visited_key_edges:
+                        nxt = cand
+                        visited_key_edges.add(edge_key)
+                        break
+                if nxt is None:
+                    break
+                ordered_keys.append(nxt)
+                prev_key, curr_key = curr_key, nxt
+
+            if len(ordered_keys) < 2:
+                continue
+
+            chain_lo: List[int] = []
+            chain_hi: List[int] = []
+            for key in ordered_keys:
+                pair = sorted(key_to_indices[key], key=lambda idx: float(vertices[idx][axis]))
+                chain_lo.append(pair[0])
+                chain_hi.append(pair[1])
+
+            target_sign = 1.0 if float(np.mean(axis_values)) >= 0.0 else -1.0
+            for i in range(len(chain_lo) - 1):
+                add_oriented_face((chain_lo[i], chain_lo[i + 1], chain_hi[i + 1]), target_sign)
+                add_oriented_face((chain_lo[i], chain_hi[i + 1], chain_hi[i]), target_sign)
+            continue
+
+        if HAS_SHAPELY:
+            polygon = ShapelyPolygon([(float(p[0]), float(p[1])) for p in pts_2d])
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+            if polygon.is_empty:
+                continue
+            triangles = constrained_delaunay_triangles(polygon)
+            geoms = list(triangles.geoms) if hasattr(triangles, "geoms") else [triangles]
+            coord_to_index = {
+                (round(float(vertices[idx][keep_dims[0]]), 9), round(float(vertices[idx][keep_dims[1]]), 9)): idx
+                for idx in loop
+            }
+            loop_faces: List[Tuple[int, int, int]] = []
+            missing_vertex = False
+            for tri in geoms:
+                coords_2d = list(tri.exterior.coords)[:-1]
+                if len(coords_2d) != 3:
+                    continue
+                tri_indices: List[int] = []
+                for u, v in coords_2d:
+                    idx = coord_to_index.get((round(float(u), 9), round(float(v), 9)))
+                    if idx is None:
+                        missing_vertex = True
+                        break
+                    tri_indices.append(idx)
+                if missing_vertex:
+                    loop_faces = []
+                    break
+                loop_faces.append((tri_indices[0], tri_indices[1], tri_indices[2]))
+            if loop_faces:
+                target_sign = 1.0 if float(np.mean(axis_values)) >= 0.0 else -1.0
+                for tri in loop_faces:
+                    add_oriented_face(tri, target_sign)
+                continue
+
+        _, cap_faces = triangulate_with_holes(pts_2d, [])
+        if len(cap_faces) == 0:
+            continue
+        target_sign = 1.0 if float(np.mean(axis_values)) >= 0.0 else -1.0
+        for tri in cap_faces:
+            add_oriented_face(
+                (
+                    loop[int(tri[0])],
+                    loop[int(tri[1])],
+                    loop[int(tri[2])],
+                ),
+                target_sign,
+            )
+
     return out_faces
 
 
@@ -2052,6 +2287,42 @@ def create_louvers_pair(
             v2, v3 = loop_b[idx_b1], loop_b[idx_b0]
             emit_face((v0, v3, v2))
             emit_face((v0, v2, v1))
+
+    def build_integrated_fence_loop(
+        section_vertices: List[int],
+        fence_offset: np.ndarray,
+    ) -> Optional[List[int]]:
+        """Embed the fence into the section loop instead of attaching a second shell."""
+        if len(section_vertices) < 6:
+            return None
+
+        upper_count = len(section_vertices) // 2
+        if upper_count < 3:
+            return None
+
+        num_fence_pts = max(2, int(len(section_vertices) * fence_chord_fraction / 2))
+        upper_end = min(num_fence_pts, upper_count)
+        lower_start = len(section_vertices) - 1
+        lower_end = max(upper_count, len(section_vertices) - num_fence_pts - 1)
+        if upper_end <= 1 or lower_end + 1 >= len(section_vertices):
+            return None
+
+        fence_end_upper = upper_end - 1
+        fence_end_lower = lower_end + 1
+        long_path = wrap_section_range(fence_end_upper, fence_end_lower, len(section_vertices))
+        covered_path = wrap_section_range(fence_end_lower, fence_end_upper, len(section_vertices))
+        covered_interior = covered_path[1:-1]
+        if len(long_path) < 2 or not covered_interior:
+            return None
+
+        offset_vertices: List[int] = []
+        for src_idx in covered_interior:
+            v_top = np.asarray(vertices[section_vertices[src_idx]], dtype=float) + fence_offset
+            top_idx = len(vertices)
+            vertices.append(v_top.tolist())
+            offset_vertices.append(top_idx)
+
+        return [section_vertices[idx] for idx in long_path] + offset_vertices
     
     # Reference tangent direction at 0° (top of wheel, theta = pi/2)
     # This is the "parallel to airflow" reference for all louvers when tilt=0
@@ -2241,12 +2512,37 @@ def create_louvers_pair(
                     section_vertices = [base_idx, base_idx + 1, base_idx + 2, base_idx + 3]
                     cs_idx.append(section_vertices)
             
-            # Build faces between consecutive cross‑sections
-            for i in range(len(cs_idx) - 1):
-                verts_i = cs_idx[i]
-                verts_j = cs_idx[i + 1]
-                
-                # Handle degenerate cases
+            fence_idx = None
+            next_fence_idx = None
+            if wing_fence and len(cs_idx) > 2:
+                fence_idx = int(fence_position * (len(cs_idx) - 1))
+                fence_idx = max(1, min(fence_idx, len(cs_idx) - 2))
+                next_fence_idx = min(fence_idx + 1, len(cs_idx) - 1)
+                if next_fence_idx == fence_idx:
+                    next_fence_idx = max(0, fence_idx - 1)
+
+            section_sequence: List[List[int]] = []
+            for sec_idx, section_vertices in enumerate(cs_idx):
+                section_loop = section_vertices
+                if (
+                    wing_fence
+                    and fence_idx is not None
+                    and next_fence_idx is not None
+                    and sec_idx in (fence_idx, next_fence_idx)
+                    and len(section_vertices) > 3
+                ):
+                    fence_normal = -extrude_dir * width_sign
+                    fence_offset = fence_normal * fence_height
+                    integrated_loop = build_integrated_fence_loop(section_vertices, fence_offset)
+                    if integrated_loop is not None:
+                        section_loop = integrated_loop
+                section_sequence.append(section_loop)
+
+            # Build faces between consecutive cross‑sections and fence transition loops.
+            for i in range(len(section_sequence) - 1):
+                verts_i = section_sequence[i]
+                verts_j = section_sequence[i + 1]
+
                 if len(verts_i) == 1 or len(verts_j) == 1:
                     if len(verts_i) == 1 and len(verts_j) > 1:
                         tip = verts_i[0]
@@ -2259,8 +2555,7 @@ def create_louvers_pair(
                             k_next = (k + 1) % len(verts_i)
                             emit_face((verts_i[k], tip, verts_i[k_next]))
                     continue
-                
-                # Both sections have multiple vertices
+
                 emit_connected_loops(verts_i, verts_j)
             
             # Cap the base and tip
@@ -2270,77 +2565,6 @@ def create_louvers_pair(
             if cs_idx and len(cs_idx[-1]) > 2:
                 emit_oriented_cap(cs_idx[-1], extrude_dir)
             
-            # Add wing fence if enabled
-            if wing_fence and len(cs_idx) > 2:
-                fence_idx = int(fence_position * (len(cs_idx) - 1))
-                fence_idx = max(1, min(fence_idx, len(cs_idx) - 2))
-                next_fence_idx = min(fence_idx + 1, len(cs_idx) - 1)
-                if next_fence_idx == fence_idx:
-                    next_fence_idx = max(0, fence_idx - 1)
-                section_a = cs_idx[fence_idx]
-                section_b = cs_idx[next_fence_idx]
-
-                if len(section_a) == len(section_b) and len(section_a) > 3:
-                    num_fence_pts = max(2, int(len(section_a) * fence_chord_fraction / 2))
-                    upper_count = len(section_a) // 2
-                    upper_end = min(num_fence_pts, upper_count)
-                    lower_start = len(section_a) - 1
-                    lower_end = max(upper_count, len(section_a) - num_fence_pts - 1)
-                    base_indices = [0, upper_end - 1, lower_end + 1, lower_start]
-                    if len(set(base_indices)) == 4:
-                        fence_normal = -extrude_dir * width_sign
-                        fence_offset = fence_normal * fence_height
-
-                        def emit_fence_end_cap(
-                            base_loop: List[int],
-                            top_loop: List[int],
-                            target_dir: np.ndarray,
-                        ) -> None:
-                            if len(base_loop) != 4 or len(top_loop) != 4:
-                                return
-                            target_norm = np.linalg.norm(target_dir)
-                            target = target_dir / target_norm if target_norm > 1e-9 else None
-                            for idx in range(4):
-                                idx_next = (idx + 1) % 4
-                                tris = [
-                                    (base_loop[idx], base_loop[idx_next], top_loop[idx_next]),
-                                    (base_loop[idx], top_loop[idx_next], top_loop[idx]),
-                                ]
-                                for tri in tris:
-                                    if target is not None:
-                                        p0 = np.asarray(vertices[tri[0]], dtype=float)
-                                        p1 = np.asarray(vertices[tri[1]], dtype=float)
-                                        p2 = np.asarray(vertices[tri[2]], dtype=float)
-                                        normal = np.cross(p1 - p0, p2 - p0)
-                                        if np.linalg.norm(normal) > 1e-12 and np.dot(normal, target) < 0:
-                                            tri = (tri[0], tri[2], tri[1])
-                                    emit_face(tri)
-
-                        def build_fence_section(section_vertices: List[int]) -> Tuple[List[int], List[int], List[int]]:
-                            base_loop: List[int] = []
-                            for section_idx in base_indices:
-                                v_base = np.asarray(vertices[section_vertices[section_idx]], dtype=float)
-                                base_idx = len(vertices)
-                                vertices.append(v_base.tolist())
-                                base_loop.append(base_idx)
-                            top_loop: List[int] = []
-                            for base_idx in base_loop:
-                                v_top = np.asarray(vertices[base_idx], dtype=float) + fence_offset
-                                top_idx = len(vertices)
-                                vertices.append(v_top.tolist())
-                                top_loop.append(top_idx)
-                            return base_loop, top_loop, base_loop + top_loop[::-1]
-
-                        fence_base_a, fence_top_a, fence_loop_a = build_fence_section(section_a)
-                        fence_base_b, fence_top_b, fence_loop_b = build_fence_section(section_b)
-                        emit_connected_loops(fence_loop_a, fence_loop_b)
-
-                        loop_a_pts = np.array([vertices[idx] for idx in fence_loop_a], dtype=float)
-                        loop_b_pts = np.array([vertices[idx] for idx in fence_loop_b], dtype=float)
-                        sweep_dir = loop_b_pts.mean(axis=0) - loop_a_pts.mean(axis=0)
-                        emit_fence_end_cap(fence_base_a, fence_top_a, -sweep_dir)
-                        emit_fence_end_cap(fence_base_b, fence_top_b, sweep_dir)
-
     return np.array(vertices, dtype=float), faces
 
 
@@ -3206,6 +3430,18 @@ def build_fender(
             (a + louver_offset, b + louver_offset, c + louver_offset)
             for (a, b, c) in louver_faces
         )
+
+    if clip_plane_y is not None:
+        front_side_cap_faces = build_constant_coordinate_loop_caps(
+            all_vertices,
+            all_faces,
+            axis=2,
+            min_secondary_axis_value=clip_plane_y,
+            coord_tol=0.5,
+        )
+        if front_side_cap_faces:
+            all_faces.extend(front_side_cap_faces)
+            print(f"  Front side seam caps: {len(front_side_cap_faces)}")
     # Write to STL
     write_stl(output_filename, all_vertices, all_faces)
     print(f"STL file written to {output_filename}")
