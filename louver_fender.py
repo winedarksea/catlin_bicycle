@@ -223,6 +223,66 @@ def build_airfoil_perimeter(upper: np.ndarray, lower: np.ndarray) -> np.ndarray:
     return np.vstack([upper, lower[:0:-1]])
 
 
+def add_face_if_valid(
+    face_list: List[Tuple[int, int, int]],
+    vertices: Union[List[List[float]], List[np.ndarray], np.ndarray],
+    v_indices: Tuple[int, int, int],
+    area_epsilon: float = 1e-8,
+) -> bool:
+    """Append a triangle only if it has distinct vertices and non-zero area."""
+    a, b, c = v_indices
+    if a == b or b == c or a == c:
+        return False
+
+    p0 = np.asarray(vertices[a], dtype=float)
+    p1 = np.asarray(vertices[b], dtype=float)
+    p2 = np.asarray(vertices[c], dtype=float)
+    double_area = np.linalg.norm(np.cross(p1 - p0, p2 - p0))
+    if double_area <= area_epsilon:
+        return False
+
+    face_list.append((int(a), int(b), int(c)))
+    return True
+
+
+def weld_mesh_vertices(
+    vertices: np.ndarray,
+    faces: List[Tuple[int, int, int]],
+    tolerance: float = 1e-6,
+    area_epsilon: float = 1e-8,
+) -> Tuple[np.ndarray, List[Tuple[int, int, int]]]:
+    """Merge coincident vertices and drop any triangles that collapse after welding."""
+    if vertices.size == 0 or not faces:
+        return vertices.copy(), list(faces)
+
+    tol = max(float(tolerance), 1e-12)
+    quantized = np.round(vertices / tol).astype(np.int64)
+
+    unique_map: Dict[Tuple[int, int, int], int] = {}
+    remap = np.empty(len(vertices), dtype=np.int64)
+    welded_vertices: List[np.ndarray] = []
+
+    for idx, key in enumerate(map(tuple, quantized)):
+        mapped = unique_map.get(key)
+        if mapped is None:
+            mapped = len(welded_vertices)
+            unique_map[key] = mapped
+            welded_vertices.append(vertices[idx].copy())
+        remap[idx] = mapped
+
+    welded_faces: List[Tuple[int, int, int]] = []
+    welded_vertices_array = np.array(welded_vertices, dtype=float)
+    for a, b, c in faces:
+        add_face_if_valid(
+            welded_faces,
+            welded_vertices_array,
+            (int(remap[a]), int(remap[b]), int(remap[c])),
+            area_epsilon=area_epsilon,
+        )
+
+    return welded_vertices_array, welded_faces
+
+
 def rotate_vector(v: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
     """Rotate vector v around axis by angle (radians) using Rodrigues' formula."""
     # Ensure axis is unit length
@@ -1490,7 +1550,7 @@ def create_front_airfoil(
             max_camber=airfoil_camber, camber_position=airfoil_camber_position,
             n_points=section_points, kammback_start=kammback_start,
         )
-        profile_outer = np.vstack([upper, lower[::-1]])[:-1]
+        profile_outer = build_airfoil_perimeter(upper, lower)
         n_profile = profile_outer.shape[0]
         normals_raw = np.zeros_like(profile_outer)
         trailing_idx = len(upper) - 1
@@ -1590,10 +1650,7 @@ def create_front_airfoil(
     
     # Helper to validate and add faces
     def _add_face_if_valid(v_indices: Tuple[int, int, int], face_list: List[Tuple[int, int, int]]):
-        if v_indices[0] == v_indices[1] or v_indices[1] == v_indices[2] or v_indices[0] == v_indices[2]: 
-            return
-        # Will validate normal after vertices are finalized
-        face_list.append(v_indices)
+        add_face_if_valid(face_list, final_vertices_list, v_indices)
     
     faces: List[Tuple[int, int, int]] = []
     
@@ -1639,7 +1696,7 @@ def create_front_airfoil(
                         clipped_face_count += 1
                     for tri in clipped:
                         _add_face_if_valid(tri, faces)
-    
+
     print(f"    Total faces processed: {total_face_count}, clipped: {clipped_face_count}")
     
     # IMPORTANT: Rebuild final_vertices array after adding intersection vertices
@@ -1895,7 +1952,7 @@ def create_louvers_pair(
         end_angle_clamped = max(start_angle_clamped, min(max_active_angle_deg, total_arc_deg)) if total_arc_deg > 0.0 else 0.0
 
     # Account for radial extension of louver leading edge
-    if spine_centre_radius > 0:
+    if spine_centre_radius > 0 and theta_range != 0.0 and len(section_indices) > 1:
         # Calculate angular offset caused by radial extension
         inner_radius = spine_centre_radius - louver_depth
         if inner_radius > 0:
@@ -1945,6 +2002,56 @@ def create_louvers_pair(
     faces: List[Tuple[int, int, int]] = []
     taper_segments = 10
     z_dir = np.array([0.0, 0.0, 1.0])
+
+    def emit_face(v_indices: Tuple[int, int, int]) -> bool:
+        return add_face_if_valid(faces, vertices, v_indices)
+
+    def emit_oriented_cap(loop: List[int], target_dir: np.ndarray) -> None:
+        if len(loop) < 3:
+            return
+        target_norm = np.linalg.norm(target_dir)
+        if target_norm <= 1e-9:
+            target = None
+        else:
+            target = target_dir / target_norm
+        for k in range(1, len(loop) - 1):
+            tri = (loop[0], loop[k], loop[k + 1])
+            if target is not None:
+                p0 = np.asarray(vertices[tri[0]], dtype=float)
+                p1 = np.asarray(vertices[tri[1]], dtype=float)
+                p2 = np.asarray(vertices[tri[2]], dtype=float)
+                normal = np.cross(p1 - p0, p2 - p0)
+                if np.linalg.norm(normal) > 1e-12 and np.dot(normal, target) < 0:
+                    tri = (tri[0], tri[2], tri[1])
+            emit_face(tri)
+
+    def emit_connected_loops(loop_a: List[int], loop_b: List[int]) -> None:
+        if len(loop_a) < 2 or len(loop_b) < 2:
+            return
+
+        n_a = len(loop_a)
+        n_b = len(loop_b)
+        if n_a == n_b:
+            for k in range(n_a):
+                k_next = (k + 1) % n_a
+                v0, v1 = loop_a[k], loop_a[k_next]
+                v2, v3 = loop_b[k_next], loop_b[k]
+                emit_face((v0, v3, v2))
+                emit_face((v0, v2, v1))
+            return
+
+        max_n = max(n_a, n_b)
+        for k in range(max_n):
+            frac_i = k / max_n
+            frac_j = (k + 1) / max_n
+            idx_a0 = int(frac_i * n_a) % n_a
+            idx_a1 = int(frac_j * n_a) % n_a
+            idx_b0 = int(frac_i * n_b) % n_b
+            idx_b1 = int(frac_j * n_b) % n_b
+            v0, v1 = loop_a[idx_a0], loop_a[idx_a1]
+            v2, v3 = loop_b[idx_b1], loop_b[idx_b0]
+            emit_face((v0, v3, v2))
+            emit_face((v0, v2, v1))
     
     # Reference tangent direction at 0° (top of wheel, theta = pi/2)
     # This is the "parallel to airflow" reference for all louvers when tilt=0
@@ -2042,7 +2149,8 @@ def create_louvers_pair(
             base_len = louver_length - tip_len
             
             # Sample along the louver length
-            ts = np.linspace(0.0, louver_length, taper_segments + 1)
+            root_offset = 0.4 if both_sides else 0.0
+            ts = np.linspace(root_offset, louver_length, taper_segments + 1)
             
             # Calculate scale factors for taper
             if airfoil_mode:
@@ -2086,15 +2194,10 @@ def create_louvers_pair(
                         
                         # Transform airfoil points to 3D louver position
                         section_vertices = []
+                        section_profile = build_airfoil_perimeter(upper, lower)
                         
-                        # Upper surface points
-                        for pt in upper:
-                            pos_3d = centre + radial_dir * (scaled_depth - pt[0]) + vertical_dir * pt[1]
-                            vertices.append(pos_3d.tolist())
-                            section_vertices.append(len(vertices) - 1)
-                        
-                        # Lower surface points in reverse
-                        for pt in reversed(lower):
+                        # Use a single closed perimeter so the leading edge is only represented once.
+                        for pt in section_profile:
                             pos_3d = centre + radial_dir * (scaled_depth - pt[0]) + vertical_dir * pt[1]
                             vertices.append(pos_3d.tolist())
                             section_vertices.append(len(vertices) - 1)
@@ -2149,178 +2252,96 @@ def create_louvers_pair(
                         tip = verts_i[0]
                         for k in range(len(verts_j)):
                             k_next = (k + 1) % len(verts_j)
-                            faces.append((tip, verts_j[k], verts_j[k_next]))
+                            emit_face((tip, verts_j[k], verts_j[k_next]))
                     elif len(verts_j) == 1 and len(verts_i) > 1:
                         tip = verts_j[0]
                         for k in range(len(verts_i)):
                             k_next = (k + 1) % len(verts_i)
-                            faces.append((verts_i[k], tip, verts_i[k_next]))
+                            emit_face((verts_i[k], tip, verts_i[k_next]))
                     continue
                 
                 # Both sections have multiple vertices
-                n_i = len(verts_i)
-                n_j = len(verts_j)
-                
-                if n_i == n_j:
-                    for k in range(n_i):
-                        k_next = (k + 1) % n_i
-                        v0, v1 = verts_i[k], verts_i[k_next]
-                        v2, v3 = verts_j[k_next], verts_j[k]
-                        faces.append((v0, v3, v2))
-                        faces.append((v0, v2, v1))
-                else:
-                    # Different number of vertices - interpolate
-                    max_n = max(n_i, n_j)
-                    for k in range(max_n):
-                        frac_i = k / max_n
-                        frac_j = (k + 1) / max_n
-                        idx_i0 = int(frac_i * n_i) % n_i
-                        idx_i1 = int(frac_j * n_i) % n_i
-                        idx_j0 = int(frac_i * n_j) % n_j
-                        idx_j1 = int(frac_j * n_j) % n_j
-                        
-                        v0, v1 = verts_i[idx_i0], verts_i[idx_i1]
-                        v2, v3 = verts_j[idx_j1], verts_j[idx_j0]
-                        
-                        if v0 != v1 and v2 != v3:
-                            faces.append((v0, v3, v2))
-                            if v1 != v2:
-                                faces.append((v0, v2, v1))
+                emit_connected_loops(verts_i, verts_j)
             
             # Cap the base and tip
-            if cs_idx and len(cs_idx[0]) > 2 and not both_sides:
-                verts = cs_idx[0]
-                for k in range(1, len(verts) - 1):
-                    faces.append((verts[0], verts[k], verts[k + 1]))
+            if cs_idx and len(cs_idx[0]) > 2:
+                emit_oriented_cap(cs_idx[0], -extrude_dir)
             
             if cs_idx and len(cs_idx[-1]) > 2:
-                verts = cs_idx[-1]
-                for k in range(1, len(verts) - 1):
-                    faces.append((verts[0], verts[k + 1], verts[k]))
+                emit_oriented_cap(cs_idx[-1], extrude_dir)
             
             # Add wing fence if enabled
             if wing_fence and len(cs_idx) > 2:
                 fence_idx = int(fence_position * (len(cs_idx) - 1))
                 fence_idx = max(1, min(fence_idx, len(cs_idx) - 2))
-                fence_verts = cs_idx[fence_idx]
-                
-                if airfoil_mode and len(fence_verts) > 2:
-                    num_fence_pts = max(2, int(len(fence_verts) * fence_chord_fraction / 2))
-                    
-                    # Upper and lower surface fence points
-                    upper_start, upper_end = 0, min(num_fence_pts, len(fence_verts) // 2)
-                    lower_start, lower_end = len(fence_verts) - 1, max(len(fence_verts) // 2, len(fence_verts) - num_fence_pts - 1)
-                    
-                    # Calculate fence offset
-                    fence_normal = -extrude_dir * width_sign
-                    fence_offset = fence_normal * fence_height
-                    
-                    # Upper fence edge
-                    upper_fence_verts = []
-                    for vi in range(upper_start, upper_end):
-                        v_orig = np.array(vertices[fence_verts[vi]])
-                        v_fence = v_orig + fence_offset
-                        fence_v_idx = len(vertices)
-                        vertices.append(v_fence.tolist())
-                        upper_fence_verts.append(fence_v_idx)
-                    
-                    # Lower fence edge
-                    lower_fence_verts = []
-                    for vi in range(lower_start, lower_end, -1):
-                        v_orig = np.array(vertices[fence_verts[vi]])
-                        v_fence = v_orig + fence_offset
-                        fence_v_idx = len(vertices)
-                        vertices.append(v_fence.tolist())
-                        lower_fence_verts.append(fence_v_idx)
-                    
-                    # Create fence faces
-                    for i in range(len(upper_fence_verts) - 1):
-                        v0, v1 = fence_verts[upper_start + i], fence_verts[upper_start + i + 1]
-                        v2, v3 = upper_fence_verts[i + 1], upper_fence_verts[i]
-                        faces.append((v0, v1, v2))
-                        faces.append((v0, v2, v3))
-                    
-                    for i in range(len(lower_fence_verts) - 1):
-                        v0, v1 = fence_verts[lower_start - i], fence_verts[lower_start - i - 1]
-                        v2, v3 = lower_fence_verts[i + 1], lower_fence_verts[i]
-                        faces.append((v0, v1, v2))
-                        faces.append((v0, v2, v3))
-                    
-                    # Cap the fence edge
-                    if len(upper_fence_verts) > 0 and len(lower_fence_verts) > 0:
-                        # Reverse lower_fence_verts so the perimeter goes:
-                        # LE-upper → TE-upper → TE-lower → LE-lower (a proper closed loop).
-                        # Without the reversal the loop jumps TE-upper → LE-lower, creating a
-                        # twisted cap and leaving the closing edge as an open boundary.
-                        all_fence_edge = upper_fence_verts + lower_fence_verts[::-1]
-                        for i in range(1, len(all_fence_edge) - 1):
-                            faces.append((all_fence_edge[0], all_fence_edge[i], all_fence_edge[i + 1]))
+                next_fence_idx = min(fence_idx + 1, len(cs_idx) - 1)
+                if next_fence_idx == fence_idx:
+                    next_fence_idx = max(0, fence_idx - 1)
+                section_a = cs_idx[fence_idx]
+                section_b = cs_idx[next_fence_idx]
 
-                        # LE end cap — closes the leading-edge side of the fin.
-                        # Connects the two base vertices near the LE to their tip offsets.
-                        le_base_upper = fence_verts[upper_start]    # LE vertex (index 0)
-                        le_base_lower = fence_verts[lower_start]    # near-LE on lower surface
-                        le_tip_upper = upper_fence_verts[0]
-                        le_tip_lower = lower_fence_verts[0]
+                if len(section_a) == len(section_b) and len(section_a) > 3:
+                    num_fence_pts = max(2, int(len(section_a) * fence_chord_fraction / 2))
+                    upper_count = len(section_a) // 2
+                    upper_end = min(num_fence_pts, upper_count)
+                    lower_start = len(section_a) - 1
+                    lower_end = max(upper_count, len(section_a) - num_fence_pts - 1)
+                    base_indices = [0, upper_end - 1, lower_end + 1, lower_start]
+                    if len(set(base_indices)) == 4:
+                        fence_normal = -extrude_dir * width_sign
+                        fence_offset = fence_normal * fence_height
 
-                        # Outward normal for LE cap points toward the leading edge.
-                        p_le = np.array(vertices[le_base_upper])
-                        p_te_ref = np.array(vertices[fence_verts[upper_end - 1]])
-                        le_dir = p_le - p_te_ref
+                        def emit_fence_end_cap(
+                            base_loop: List[int],
+                            top_loop: List[int],
+                            target_dir: np.ndarray,
+                        ) -> None:
+                            if len(base_loop) != 4 or len(top_loop) != 4:
+                                return
+                            target_norm = np.linalg.norm(target_dir)
+                            target = target_dir / target_norm if target_norm > 1e-9 else None
+                            for idx in range(4):
+                                idx_next = (idx + 1) % 4
+                                tris = [
+                                    (base_loop[idx], base_loop[idx_next], top_loop[idx_next]),
+                                    (base_loop[idx], top_loop[idx_next], top_loop[idx]),
+                                ]
+                                for tri in tris:
+                                    if target is not None:
+                                        p0 = np.asarray(vertices[tri[0]], dtype=float)
+                                        p1 = np.asarray(vertices[tri[1]], dtype=float)
+                                        p2 = np.asarray(vertices[tri[2]], dtype=float)
+                                        normal = np.cross(p1 - p0, p2 - p0)
+                                        if np.linalg.norm(normal) > 1e-12 and np.dot(normal, target) < 0:
+                                            tri = (tri[0], tri[2], tri[1])
+                                    emit_face(tri)
 
-                        for tri in [
-                            (le_base_upper, le_tip_upper, le_tip_lower),
-                            (le_base_upper, le_tip_lower, le_base_lower),
-                        ]:
-                            p0 = np.array(vertices[tri[0]])
-                            p1 = np.array(vertices[tri[1]])
-                            p2 = np.array(vertices[tri[2]])
-                            normal = np.cross(p1 - p0, p2 - p0)
-                            if np.dot(normal, le_dir) < 0:
-                                faces.append((tri[0], tri[2], tri[1]))
-                            else:
-                                faces.append(tri)
+                        def build_fence_section(section_vertices: List[int]) -> Tuple[List[int], List[int], List[int]]:
+                            base_loop: List[int] = []
+                            for section_idx in base_indices:
+                                v_base = np.asarray(vertices[section_vertices[section_idx]], dtype=float)
+                                base_idx = len(vertices)
+                                vertices.append(v_base.tolist())
+                                base_loop.append(base_idx)
+                            top_loop: List[int] = []
+                            for base_idx in base_loop:
+                                v_top = np.asarray(vertices[base_idx], dtype=float) + fence_offset
+                                top_idx = len(vertices)
+                                vertices.append(v_top.tolist())
+                                top_loop.append(top_idx)
+                            return base_loop, top_loop, base_loop + top_loop[::-1]
 
-                        # TE-chord end cap — closes the chordwise-cutoff side of the fin.
-                        # Connects the last upper/lower base vertices to their tip offsets.
-                        te_base_upper = fence_verts[upper_end - 1]
-                        te_base_lower = fence_verts[lower_end + 1]
-                        te_tip_upper = upper_fence_verts[-1]
-                        te_tip_lower = lower_fence_verts[-1]
+                        fence_base_a, fence_top_a, fence_loop_a = build_fence_section(section_a)
+                        fence_base_b, fence_top_b, fence_loop_b = build_fence_section(section_b)
+                        emit_connected_loops(fence_loop_a, fence_loop_b)
 
-                        # Outward normal for TE cap points away from the leading edge.
-                        te_dir = p_te_ref - p_le
+                        loop_a_pts = np.array([vertices[idx] for idx in fence_loop_a], dtype=float)
+                        loop_b_pts = np.array([vertices[idx] for idx in fence_loop_b], dtype=float)
+                        sweep_dir = loop_b_pts.mean(axis=0) - loop_a_pts.mean(axis=0)
+                        emit_fence_end_cap(fence_base_a, fence_top_a, -sweep_dir)
+                        emit_fence_end_cap(fence_base_b, fence_top_b, sweep_dir)
 
-                        for tri in [
-                            (te_base_upper, te_tip_upper, te_tip_lower),
-                            (te_base_upper, te_tip_lower, te_base_lower),
-                        ]:
-                            p0 = np.array(vertices[tri[0]])
-                            p1 = np.array(vertices[tri[1]])
-                            p2 = np.array(vertices[tri[2]])
-                            normal = np.cross(p1 - p0, p2 - p0)
-                            if np.dot(normal, te_dir) < 0:
-                                faces.append((tri[0], tri[2], tri[1]))
-                            else:
-                                faces.append(tri)
-                
-                elif not airfoil_mode and len(fence_verts) == 4:
-                    # Rectangular fence
-                    v0, v1, v2, v3 = fence_verts
-                    fence_normal = -extrude_dir * width_sign
-                    fence_offset = fence_normal * fence_height
-                    
-                    v2_orig, v3_orig = np.array(vertices[v2]), np.array(vertices[v3])
-                    v2_fence, v3_fence = v2_orig + fence_offset, v3_orig + fence_offset
-                    
-                    v2_fence_idx = len(vertices)
-                    v3_fence_idx = len(vertices) + 1
-                    vertices.extend([v2_fence.tolist(), v3_fence.tolist()])
-                    
-                    faces.append((v2, v3, v3_fence_idx))
-                    faces.append((v2, v3_fence_idx, v2_fence_idx))
-
-    return np.array(vertices), faces
+    return np.array(vertices, dtype=float), faces
 
 
 def write_stl(
@@ -2473,10 +2494,12 @@ def build_single_louver(
     base_mid = n_dir * spine_radius
     vertical_vec = np.array([0.0, 0.0, louver_thickness])
     
-    v2 = base_mid + 0.5 * vertical_vec  # Outer top
-    v3 = base_mid - 0.5 * vertical_vec  # Outer bottom
+    v0 = base_mid - 0.5 * vertical_vec  # Inner bottom
+    v1 = base_mid + 0.5 * vertical_vec  # Inner top
+    v2 = v1.copy()  # Outer top
+    v3 = v0.copy()  # Outer bottom
     
-    spine_vertices = np.array([base_mid.tolist(), base_mid.tolist(), v2.tolist(), v3.tolist()])
+    spine_vertices = np.array([v0.tolist(), v1.tolist(), v2.tolist(), v3.tolist()])
     section_indices = [(0, 1, 2, 3)]
     thetas = np.array([theta])
     
@@ -3169,15 +3192,20 @@ def build_fender(
                 for (a, b, c) in front_airfoil_faces[-front_cap_face_count:]
             )
 
+    body_vertices = np.vstack(combined_vertices)
+    body_faces = list(combined_faces)
+    body_vertices, body_faces = weld_mesh_vertices(body_vertices, body_faces)
+
+    all_vertices = body_vertices
+    all_faces = body_faces
+
     if louver_vertices.size > 0:
-        combined_vertices.append(louver_vertices)
-        combined_faces.extend(
-            (a + running_offset, b + running_offset, c + running_offset)
+        louver_offset = len(all_vertices)
+        all_vertices = np.vstack([all_vertices, louver_vertices])
+        all_faces.extend(
+            (a + louver_offset, b + louver_offset, c + louver_offset)
             for (a, b, c) in louver_faces
         )
-
-    all_vertices = np.vstack(combined_vertices)
-    all_faces = combined_faces
     # Write to STL
     write_stl(output_filename, all_vertices, all_faces)
     print(f"STL file written to {output_filename}")
@@ -3230,7 +3258,7 @@ if __name__ == "__main__":
         kammback_start=0.82,            # 82% cut - earlier for thicker trailing edge, better separation control
         airfoil_points=24,              # Points per airfoil section for smooth curves
         # Wing fences block span-wise flow in the inward-pressure environment
-        wing_fence=True,                # Enable wing fences to reduce induced drag
+        wing_fence=False,               # Disabled for cleaner manifold STL export
         fence_position=0.65,            # Fence at 65% span from spine to tip
         fence_height=1.0,               # 1mm fence height - thin but effective flow blocker
         fence_chord_fraction=0.8,       # Fence extends 80% along chord from leading edge
