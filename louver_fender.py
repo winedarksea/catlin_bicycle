@@ -3311,7 +3311,8 @@ def build_fender(
     # spine from protruding forward of that plane, we clip the spine separately here.
     # ONLY apply this if the airfoil starts at the very beginning of the spine.
     # If the airfoil starts later (e.g. extension > 90 deg), let the spine lead.
-    clip_plane_y = infer_clip_plane_y(front_airfoil_vertices, front_airfoil_faces)
+    clip_plane_meta = front_airfoil_metadata.get("clip_plane_y")
+    clip_plane_y = float(clip_plane_meta) if clip_plane_meta is not None else None
     if (clip_plane_y is not None and spine_vertices.size > 0 and spine_faces and 
         front_airfoil_start_relative < 1e-6):
         print(f"\n=== SPINE FRONT CLIP ===")
