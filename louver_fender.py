@@ -318,7 +318,9 @@ def create_spine(
     spine_segments: int,
     forward_extension_deg: float = 0.0,
     smooth_spine: bool = True,
-) -> Tuple[np.ndarray, List[Tuple[int, int, int]]]:
+    outer_corner_radius_mm: float = 2.0,
+    outer_corner_segments: int = 4,
+) -> Tuple[np.ndarray, List[Tuple[int, int, int]], Dict[str, object]]:
     """Construct a curved rectangular spine along an arc.
 
     Parameters
@@ -345,12 +347,18 @@ def create_spine(
         If True, apply Gaussian smoothing to spine vertex positions for
         smoother curvature (default True).
 
+    outer_corner_radius_mm : float, optional
+        Radius for rounding only the trailing (outer) top/bottom spine corners.
+        Set to 0.0 to keep a fully rectangular cross-section (default 2.0 mm).
+    outer_corner_segments : int, optional
+        Number of segments used per rounded outer corner arc (default 4).
+
     Returns
     -------
-    Tuple[np.ndarray, List[Tuple[int, int, int]]]
+    Tuple[np.ndarray, List[Tuple[int, int, int]], Dict[str, object]]
         A tuple containing the array of vertices (shape (N, 3)) and a list
         of triangular faces (triplets of vertex indices) representing the
-        spine geometry.
+        spine geometry, plus metadata with per-section anchor indices.
     """
     # Calculate the radius to the centre of the spine cross‐section
     spine_centre_radius = spine_inner_radius + spine_width / 2.0
@@ -380,8 +388,73 @@ def create_spine(
         return spine_thickness * (1.0 + lerp * 1.0)
 
     # Compute cross‐section vertices for each segment
-    section_indices = []
+    section_indices: List[Tuple[int, int, int, int]] = []
+    section_loops: List[List[int]] = []
+    section_start_indices: List[int] = []
+    section_local_offsets: List[np.ndarray] = []
     section_centers = []  # Track center positions for smoothing
+
+    def build_section_profile(local_thickness: float) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+        """Build local (radial, vertical) section profile and key anchor indices."""
+        half_w = spine_width / 2.0
+        half_t = local_thickness / 2.0
+        corner_radius = max(
+            0.0,
+            min(float(outer_corner_radius_mm), half_w, half_t),
+        )
+
+        if corner_radius <= 1e-6 or outer_corner_segments <= 0:
+            offsets = np.array([
+                [-half_w, -half_t],
+                [-half_w, half_t],
+                [half_w, half_t],
+                [half_w, -half_t],
+            ], dtype=float)
+            return offsets, (0, 1, 2, 3)
+
+        pts: List[Tuple[float, float]] = [
+            (-half_w, -half_t),
+            (-half_w, half_t),
+            (half_w - corner_radius, half_t),
+        ]
+
+        def append_unique(x_val: float, z_val: float, tol: float = 1e-9) -> None:
+            if not pts:
+                pts.append((x_val, z_val))
+                return
+            px, pz = pts[-1]
+            if abs(px - x_val) <= tol and abs(pz - z_val) <= tol:
+                return
+            pts.append((x_val, z_val))
+
+        # Top outer corner arc: from top face to outer face.
+        top_center = np.array([half_w - corner_radius, half_t - corner_radius], dtype=float)
+        for k in range(1, outer_corner_segments + 1):
+            phi = (math.pi / 2.0) * (1.0 - k / outer_corner_segments)
+            x = top_center[0] + corner_radius * math.cos(phi)
+            z = top_center[1] + corner_radius * math.sin(phi)
+            append_unique(float(x), float(z))
+
+        # Straight outer face segment between the two rounded corners.
+        append_unique(half_w, -half_t + corner_radius)
+
+        # Bottom outer corner arc: from outer face back to bottom face.
+        bottom_center = np.array([half_w - corner_radius, -half_t + corner_radius], dtype=float)
+        for k in range(1, outer_corner_segments + 1):
+            phi = -(math.pi / 2.0) * (k / outer_corner_segments)
+            x = bottom_center[0] + corner_radius * math.cos(phi)
+            z = bottom_center[1] + corner_radius * math.sin(phi)
+            append_unique(float(x), float(z))
+
+        offsets = np.array(pts, dtype=float)
+        x_vals = offsets[:, 0]
+        max_x = float(np.max(x_vals))
+        outer_candidates = [i for i, xv in enumerate(x_vals) if abs(float(xv) - max_x) <= 1e-9]
+        if not outer_candidates:
+            outer_candidates = [2, len(pts) - 1]
+        outer_top_idx = max(outer_candidates, key=lambda idx: float(offsets[idx, 1]))
+        outer_bottom_idx = min(outer_candidates, key=lambda idx: float(offsets[idx, 1]))
+        return offsets, (0, 1, outer_top_idx, outer_bottom_idx)
     
     for theta in thetas:
         n_dir = np.array([math.cos(theta), math.sin(theta), 0.0])
@@ -390,15 +463,19 @@ def create_spine(
         section_centers.append(centre)
 
         local_thickness = get_local_thickness(theta)
-
-        # Four corners of the rectangular cross‐section
-        v0 = centre - (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
-        v1 = centre - (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
-        v2 = centre + (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
-        v3 = centre + (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
+        local_offsets, local_anchor_idx = build_section_profile(local_thickness)
+        section_local_offsets.append(local_offsets)
         base_idx = len(vertices)
-        vertices.extend([v0.tolist(), v1.tolist(), v2.tolist(), v3.tolist()])
-        section_indices.append((base_idx, base_idx + 1, base_idx + 2, base_idx + 3))
+        section_start_indices.append(base_idx)
+
+        section_loop: List[int] = []
+        for radial_off, vertical_off in local_offsets:
+            v = centre + radial_off * n_dir + vertical_off * z_dir
+            vertices.append(v.tolist())
+            section_loop.append(len(vertices) - 1)
+
+        section_loops.append(section_loop)
+        section_indices.append(tuple(base_idx + idx for idx in local_anchor_idx))
 
     # Apply smoothing to vertex positions if requested
     if smooth_spine and len(section_centers) >= 5:
@@ -406,49 +483,58 @@ def create_spine(
         centers_array = np.array(section_centers)
         smoothed_centers = gaussian_smooth_5point(centers_array, iterations=1)
         
-        # Rebuild vertices with smoothed centers
+        # Rebuild vertices with smoothed centers while preserving local section profile.
         vertices_array = np.array(vertices)
-        for i, (theta, smooth_center) in enumerate(zip(thetas, smoothed_centers)):
+        for i, (theta, smooth_center, local_offsets) in enumerate(
+            zip(thetas, smoothed_centers, section_local_offsets)
+        ):
             n_dir = np.array([math.cos(theta), math.sin(theta), 0.0])
             z_dir = np.array([0.0, 0.0, 1.0])
-            
-            local_thickness = get_local_thickness(theta)
-            
-            # Rebuild the four corners with smoothed center
-            base_idx = i * 4
-            vertices_array[base_idx] = smooth_center - (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
-            vertices_array[base_idx + 1] = smooth_center - (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
-            vertices_array[base_idx + 2] = smooth_center + (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
-            vertices_array[base_idx + 3] = smooth_center + (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
-            base_idx = i * 4
-            vertices_array[base_idx] = smooth_center - (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
-            vertices_array[base_idx + 1] = smooth_center - (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
-            vertices_array[base_idx + 2] = smooth_center + (spine_width / 2.0) * n_dir + (local_thickness / 2.0) * z_dir
-            vertices_array[base_idx + 3] = smooth_center + (spine_width / 2.0) * n_dir - (local_thickness / 2.0) * z_dir
+
+            loop = section_loops[i]
+            for local_idx, vert_idx in enumerate(loop):
+                radial_off, vertical_off = local_offsets[local_idx]
+                vertices_array[vert_idx] = smooth_center + radial_off * n_dir + vertical_off * z_dir
         
         vertices = vertices_array.tolist()
 
     # Create faces between consecutive segments
-    for i in range(len(section_indices) - 1):
-        v0_i, v1_i, v2_i, v3_i = section_indices[i]
-        v0_j, v1_j, v2_j, v3_j = section_indices[i + 1]
-        # Inside, top, outside, and bottom faces
-        faces.extend([
-            (v0_i, v0_j, v1_j), (v0_i, v1_j, v1_i),
-            (v1_i, v1_j, v2_j), (v1_i, v2_j, v2_i),
-            (v2_i, v2_j, v3_j), (v2_i, v3_j, v3_i),
-            (v3_i, v3_j, v0_j), (v3_i, v0_j, v0_i),
-        ])
+    for i in range(len(section_loops) - 1):
+        loop_i = section_loops[i]
+        loop_j = section_loops[i + 1]
+        n_i = len(loop_i)
+        n_j = len(loop_j)
+        if n_i == n_j:
+            for k in range(n_i):
+                k_next = (k + 1) % n_i
+                v0, v1 = loop_i[k], loop_i[k_next]
+                v2, v3 = loop_j[k_next], loop_j[k]
+                faces.append((v0, v3, v2))
+                faces.append((v0, v2, v1))
+            continue
+
+        max_n = max(n_i, n_j)
+        for k in range(max_n):
+            frac_i = k / max_n
+            frac_j = (k + 1) / max_n
+            idx_i0 = int(frac_i * n_i) % n_i
+            idx_i1 = int(frac_j * n_i) % n_i
+            idx_j0 = int(frac_i * n_j) % n_j
+            idx_j1 = int(frac_j * n_j) % n_j
+            v0, v1 = loop_i[idx_i0], loop_i[idx_i1]
+            v2, v3 = loop_j[idx_j1], loop_j[idx_j0]
+            faces.append((v0, v3, v2))
+            faces.append((v0, v2, v1))
+
     # Add end caps
-    def add_cap(section_idx: Tuple[int, int, int, int], theta: float, outward_sign: float) -> None:
-        """Triangulate a rectangular end cap with outward normal control."""
+    def add_cap(section_loop: List[int], theta: float, outward_sign: float) -> None:
+        """Triangulate an end cap with outward normal control."""
+        if len(section_loop) < 3:
+            return
         t_dir = np.array([-math.sin(theta), math.cos(theta), 0.0])
         target_dir = t_dir * outward_sign
-        cap_tris = [
-            (section_idx[0], section_idx[1], section_idx[2]),
-            (section_idx[0], section_idx[2], section_idx[3]),
-        ]
-        for tri in cap_tris:
+        for k in range(1, len(section_loop) - 1):
+            tri = (section_loop[0], section_loop[k], section_loop[k + 1])
             p0, p1, p2 = np.array(vertices[tri[0]]), np.array(vertices[tri[1]]), np.array(vertices[tri[2]])
             normal = np.cross(p1 - p0, p2 - p0)
             if np.linalg.norm(normal) == 0:
@@ -458,11 +544,16 @@ def create_spine(
             else:
                 faces.append(tri)
 
-    if section_indices:
-        add_cap(section_indices[0], thetas[0], outward_sign=-1.0)
-        add_cap(section_indices[-1], thetas[-1], outward_sign=1.0)
+    if section_loops:
+        add_cap(section_loops[0], thetas[0], outward_sign=-1.0)
+        add_cap(section_loops[-1], thetas[-1], outward_sign=1.0)
 
-    return np.array(vertices), faces
+    metadata: Dict[str, object] = {
+        "section_anchor_indices": section_indices,
+        "section_start_indices": section_start_indices,
+        "vertices_per_section": [len(loop) for loop in section_loops],
+    }
+    return np.array(vertices), faces, metadata
 
 
 def compute_plane_intersection(p1: np.ndarray, p2: np.ndarray, y_plane: float, eps: float = 1e-9) -> Optional[np.ndarray]:
@@ -2914,6 +3005,8 @@ def build_fender(
     spine_width: float = 5.0,
     spine_thickness: float = 3.0,
     spine_segments: int = 50,
+    outer_corner_radius_mm: float = 2.0,
+    outer_corner_segments: int = 4,
     louver_length: float = 40.0,
     louver_depth: float = 15.0,
     louver_spacing: float = -0.0,
@@ -3014,6 +3107,11 @@ def build_fender(
         Vertical thickness of the spine cross‐section.
     spine_segments : int, optional
         Number of segments used to approximate the spine arc.
+    outer_corner_radius_mm : float, optional
+        Radius for rounding only the trailing (outer) top/bottom corners of the
+        spine cross-section. Set to 0.0 for a fully rectangular spine (default 2.0 mm).
+    outer_corner_segments : int, optional
+        Number of segments used per rounded outer corner arc (default 4).
     louver_length : float, optional
         Length of each louver measured from the spine to the tip (default 40mm).
     louver_depth : float, optional
@@ -3115,21 +3213,23 @@ def build_fender(
 
     # Build spine
     # Note: create_spine expects forward_extension_deg as a positive value
-    spine_vertices, spine_faces = create_spine(
+    spine_vertices, spine_faces, spine_metadata = create_spine(
         spine_inner_radius=spine_inner_radius_mm,
         spine_width=spine_width,
         spine_thickness=spine_thickness,
         coverage_angle_deg=coverage_angle_deg,
         spine_segments=spine_segments,
         forward_extension_deg=abs(forward_extension_deg),
+        outer_corner_radius_mm=outer_corner_radius_mm,
+        outer_corner_segments=outer_corner_segments,
     )
     # Recompute thetas consistent with create_spine
     theta_start = math.pi / 2.0 - math.radians(abs(forward_extension_deg))
     theta_end = theta_start + math.radians(total_coverage_deg)
     thetas = np.linspace(theta_start, theta_end, spine_segments + 1)
-    seg_indices = [
-        (i * 4, i * 4 + 1, i * 4 + 2, i * 4 + 3) for i in range(spine_segments + 1)
-    ]
+    seg_indices = list(spine_metadata.get("section_anchor_indices", []))
+    if not seg_indices:
+        raise RuntimeError("create_spine did not return section anchor indices.")
 
     def clamp(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
@@ -3319,8 +3419,12 @@ def build_fender(
         print(f"  Clipping spine at Y={clip_plane_y:.4f} mm to match front airfoil cut")
         # Clip only the forward-most portion of the spine. A constant-y plane intersects
         # the spine arc twice; clipping the entire spine would also trim the rear.
-        n_sections = int(spine_vertices.shape[0] // 4)
-        section_y = np.array([spine_vertices[i * 4, 1] for i in range(n_sections)])
+        section_starts = list(spine_metadata.get("section_start_indices", []))
+        n_sections = len(section_starts)
+        if n_sections == 0:
+            section_starts = [anchors[0] for anchors in seg_indices]
+            n_sections = len(section_starts)
+        section_y = np.array([spine_vertices[int(section_starts[i]), 1] for i in range(n_sections)])
         first_above = None
         for i, y_val in enumerate(section_y):
             if y_val >= clip_plane_y - 1e-9:
@@ -3329,7 +3433,10 @@ def build_fender(
         if first_above is None or first_above <= 0:
             print("  Spine clip skipped (no forward crossing found)")
         else:
-            max_vertex_index_exclusive = (first_above + 1) * 4
+            if first_above + 1 < n_sections:
+                max_vertex_index_exclusive = int(section_starts[first_above + 1])
+            else:
+                max_vertex_index_exclusive = int(spine_vertices.shape[0])
             clipped_spine_vertices, clipped_spine_faces, _ = clip_mesh_prefix_against_yplane(
                 spine_vertices,
                 spine_faces,
