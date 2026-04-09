@@ -2649,12 +2649,19 @@ def create_louvers_pair(
 
                 emit_connected_loops(verts_i, verts_j)
             
-            # Cap the base and tip
+            # Cap the base and tip.
+            # Cross-sections lie in the (radial_dir, vertical_dir) plane whose
+            # geometric normal is radial_dir × Z = -t_dir (tangential direction).
+            # Using ±extrude_dir as the orientation reference gives dot≈0 and
+            # unreliable floating-point flip decisions.  t_dir is perpendicular
+            # to the cross-section plane and gives dot=±1, so:
+            #   root cap  target = -t_dir → dot = +1 → no flip (correct)
+            #   tip  cap  target = +t_dir → dot = -1 → flip   (correct)
             if cs_idx and len(cs_idx[0]) > 2:
-                emit_oriented_cap(cs_idx[0], -extrude_dir)
-            
+                emit_oriented_cap(cs_idx[0], -t_dir)
+
             if cs_idx and len(cs_idx[-1]) > 2:
-                emit_oriented_cap(cs_idx[-1], extrude_dir)
+                emit_oriented_cap(cs_idx[-1], t_dir)
             
     return np.array(vertices, dtype=float), faces
 
