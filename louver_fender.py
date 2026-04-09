@@ -16,8 +16,10 @@ the blades permit front-to-back airflow with minimal aerodynamic drag.
 
 This implementation is a simplified design without hardware mounting points or secondary structural details.
 
+Manifold structure analysis requires float32 comparisons as tolerances can be quite small.
+
 Potential Future Improvements:
-- Round the corners of the spine and/or add a gutter to the spine
+- Add a gutter to the spine
 - Add an option for reduced louver angle (parallel to ground) with longer chord lengths
 - Add a slight twist to the louver wings to create outwash
 """
@@ -532,7 +534,7 @@ def create_spine(
         if len(section_loop) < 3:
             return
         t_dir = np.array([-math.sin(theta), math.cos(theta), 0.0])
-        target_dir = t_dir * outward_sign
+        target_dir = -t_dir * outward_sign
         for k in range(1, len(section_loop) - 1):
             tri = (section_loop[0], section_loop[k], section_loop[k + 1])
             p0, p1, p2 = np.array(vertices[tri[0]]), np.array(vertices[tri[1]]), np.array(vertices[tri[2]])
@@ -3466,6 +3468,7 @@ def build_fender(
                 spine_cap_faces = []
                 print(f"  Spine clip cap skipped: {exc}")
             if spine_cap_faces:
+                spine_cap_faces = [(a, c, b) for (a, b, c) in spine_cap_faces]
                 spine_faces = list(spine_faces) + spine_cap_faces
                 print(f"  Spine clip cap faces: {len(spine_cap_faces)}")
         print(f"=== END SPINE FRONT CLIP ===\n")
