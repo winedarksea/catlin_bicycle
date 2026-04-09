@@ -203,7 +203,7 @@ def build_seatpost_fairing(
     airfoil_camber: float = 0.00,
     airfoil_camber_position: float = 0.35,
     kammback_start: float = 0.64,
-    profile_points: int = 64,
+    profile_points: int = 128,
     bore_circle_points: int = 64,
     output_filename: str = "seatpost_fairing.stl",
 ) -> str:
